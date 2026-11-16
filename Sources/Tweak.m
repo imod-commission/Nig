@@ -46,6 +46,11 @@ static __thread BOOL tInHook = NO;
 // 0 = not inside a view's drawLayer:inContext: at all. Core Graphics colour
 // hooks only act in state 1, so glyphs are never lightened over a light surface.
 static __thread int tDrawState = 0;
+// Set while Nig renders the window to look at the pixels behind a view: the
+// drawing it triggers must still be recoloured like any other drawing.
+static __thread BOOL tSampling = NO;
+// Bumped whenever a surface colour changes, which invalidates sampled backdrops.
+static NSUInteger gSampleEpoch = 0;
 // How the app itself resolves dynamic colours: dark when the app follows the
 // system appearance (its dynamic colours are then already dark), light when it
 // is locked to light. Fixed by the window's real trait in NigRefresh.
@@ -377,6 +382,90 @@ static NigBackdrop NigBackdropOf(UIView *view) {
     return NigBackdropDark;
 }
 
+// What is really behind a view, by looking: the window is rendered with the
+// view hidden, into a few pixels covering the view's frame. The app's own
+// colours and Nig's both show up there, so text follows what is directly under
+// it: dark underneath becomes light text, light underneath keeps dark text.
+// Returns NO when nothing reliable can be read (nothing drawn there, GPU content).
+static BOOL NigSampleBehind(UIView *view, CGFloat *mean, CGFloat *spread) {
+    UIWindow *window = view.window;
+    if (!window || view.bounds.size.width < 1 || view.bounds.size.height < 1) return NO;
+    CGRect r = CGRectIntersection([view convertRect:view.bounds toView:window], window.bounds);
+    if (CGRectIsNull(r) || r.size.width < 1 || r.size.height < 1) return NO;
+
+    NSDictionary *cached = NigStoreGet(view, @"behind");
+    if (cached && [cached[@"epoch"] unsignedIntegerValue] == gSampleEpoch &&
+        CGRectEqualToRect(CGRectIntegral(r), CGRectIntegral(CGRectFromString(cached[@"rect"]))) &&
+        CACurrentMediaTime() - [cached[@"time"] doubleValue] < 0.5) {
+        if (![cached[@"ok"] boolValue]) return NO;
+        *mean = [cached[@"mean"] doubleValue];
+        *spread = [cached[@"spread"] doubleValue];
+        return YES;
+    }
+
+    enum { N = 4 };
+    uint8_t px[N * N * 4];
+    memset(px, 0, sizeof(px));
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx = CGBitmapContextCreate(px, N, N, 8, N * 4, cs,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return NO;
+    CGContextTranslateCTM(ctx, 0, N);
+    CGContextScaleCTM(ctx, 1, -1);  // UIKit's orientation
+    CGContextScaleCTM(ctx, N / r.size.width, N / r.size.height);
+    CGContextTranslateCTM(ctx, -r.origin.x, -r.origin.y);
+
+    BOOL previousInHook = tInHook, previousSampling = tSampling;
+    tInHook = YES;
+    tSampling = YES;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    BOOL wasHidden = view.layer.hidden;
+    view.layer.hidden = YES;
+    [window.layer renderInContext:ctx];
+    view.layer.hidden = wasHidden;
+    [CATransaction commit];
+    tSampling = previousSampling;
+    tInHook = previousInHook;
+    CGContextRelease(ctx);
+
+    double sum = 0, lo = 1, hi = 0;
+    int covered = 0;
+    for (int i = 0; i < N * N; i++) {
+        double a = px[i * 4 + 3] / 255.0;
+        if (a < 0.9) continue;
+        covered++;
+        double l = NigLuma(px[i * 4] / 255.0 / a, px[i * 4 + 1] / 255.0 / a, px[i * 4 + 2] / 255.0 / a);
+        sum += l; lo = MIN(lo, l); hi = MAX(hi, l);
+    }
+    BOOL ok = covered >= (N * N * 3) / 4;
+    CGFloat m = ok ? sum / covered : 0, sp = ok ? hi - lo : 0;
+    NigStoreSet(view, @"behind", @{@"epoch": @(gSampleEpoch), @"rect": NSStringFromCGRect(CGRectIntegral(r)),
+                                   @"time": @(CACurrentMediaTime()), @"ok": @(ok), @"mean": @(m), @"spread": @(sp)});
+    if (!ok) return NO;
+    *mean = m; *spread = sp;
+    return YES;
+}
+
+// For text and glyphs: the backdrop as it looks, falling back to the model
+// (NigBackdropOf) when it cannot be read.
+static NigBackdrop NigTextBackdrop(UIView *view) {
+    if (view.window && [NSThread isMainThread]) {
+        for (UIView *v = view; v; v = v.superview) {
+            if ([v isKindOfClass:[UIVisualEffectView class]]) return NigBackdropDark;  // bars are forced dark
+        }
+        CGFloat mean, spread;
+        if (NigSampleBehind(view, &mean, &spread)) {
+            if (spread > 0.45) return NigBackdropMedia;
+            if (mean < 0.45) return NigBackdropDark;
+            if (mean > 0.55) return NigBackdropLight;
+            return NigBackdropMedia;
+        }
+    }
+    return NigBackdropOf(view);
+}
+
 #pragma mark - Decisions
 
 static UIColor *NigDesiredBackground(UIColor *orig) {
@@ -385,12 +474,13 @@ static UIColor *NigDesiredBackground(UIColor *orig) {
 
 // Text only follows when the surface behind it is dark.
 static UIColor *NigDesiredText(UIView *view, UIColor *orig) {
-    if (!orig || NigBackdropOf(view) != NigBackdropDark) return nil;
+    if (!orig || NigTransformColor(orig, NigRoleText) == nil) return nil;  // cheap test first
+    if (NigTextBackdrop(view) != NigBackdropDark) return nil;
     return NigTransformColor(orig, NigRoleText);
 }
 
 static NSAttributedString *NigTransformAttr(NSAttributedString *attr, UIView *view) {
-    if (attr.length == 0 || NigBackdropOf(view) != NigBackdropDark) return attr;
+    if (attr.length == 0 || NigTextBackdrop(view) != NigBackdropDark) return attr;
     __block NSMutableAttributedString *m = nil;
     [attr enumerateAttribute:NSForegroundColorAttributeName
                      inRange:NSMakeRange(0, attr.length)
@@ -431,7 +521,7 @@ static void NigSyncColor(UIView *view, NSString *key, UIColor *current, BOOL act
     UIColor *want = active ? (desired(orig) ?: orig) : orig;
     if (active && want != orig) NigStoreSet(view, key, orig);
     else NigStoreRemove(view, key);
-    if (current != want && ![current isEqual:want]) set(want);
+    if (current != want && ![current isEqual:want]) { gSampleEpoch++; set(want); }
 }
 
 static void NigApplyLabel(UILabel *label, BOOL active) {
@@ -637,7 +727,7 @@ static void NigApplyImageView(UIImageView *iv, BOOL active) {
     UIImage *cur = iv.image;
     UIImage *orig = (rec && cur == rec[@"out"]) ? rec[@"orig"] : cur;
     UIImage *want = nil;
-    if (active && orig && NigBackdropOf(iv) == NigBackdropDark) {
+    if (active && orig && NigTextBackdrop(iv) == NigBackdropDark) {
         UIColor *tint = NigIconTint(orig);
         if (tint) want = NigRecolored(orig, tint);
     }
@@ -663,10 +753,10 @@ static void NigSyncLayerColor(CALayer *layer, NSString *key, CGColorRef current,
     if (!orig) return;
     UIColor *want = active ? NigTransformColor(orig, role) : nil;
     if (want) {
-        if (!(cur && [cur isEqual:want])) set(want.CGColor);
+        if (!(cur && [cur isEqual:want])) { gSampleEpoch++; set(want.CGColor); }
         NigStoreSet(layer, key, @{@"orig": orig, @"out": want});
     } else {
-        if (rec && ![orig isEqual:cur]) set(orig.CGColor);
+        if (rec && ![orig isEqual:cur]) { gSampleEpoch++; set(orig.CGColor); }
         NigStoreRemove(layer, key);
     }
 }
@@ -704,7 +794,7 @@ static void NigApplyTextLayers(UIView *view, BOOL active) {
     BOOL dark = NO, known = NO;
     for (CALayer *s in [subs copy]) {
         if (![s isKindOfClass:[CATextLayer class]]) continue;
-        if (!known) { dark = active && NigBackdropOf(view) == NigBackdropDark; known = YES; }
+        if (!known) { dark = active && NigTextBackdrop(view) == NigBackdropDark; known = YES; }
         CATextLayer *t = (CATextLayer *)s;
         NigSyncLayerColor(t, @"textLayerFg", t.foregroundColor, dark, NigRoleText,
                           ^(CGColorRef c) { t.foregroundColor = c; });
@@ -846,6 +936,7 @@ static void NigRefresh(void) {
     UIWindow *probe = NigProbeWindow(windows);
     if (!probe) return;  // no window yet: a later notification retries
 
+    gSampleEpoch++;
     BOOL system = NigSystemIsDark(YES);
     // Dynamic colours are read the way the app itself resolves them.
     BOOL traitDark = (probe.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
@@ -906,6 +997,7 @@ static void HookedSetBackgroundColor(UIView *self, SEL _cmd, UIColor *color) {
         OrigSetBackgroundColor(self, _cmd, color);
         return;
     }
+    gSampleEpoch++;
     UIColor *want = NigDesiredBackground(color);
     if (want) NigStoreSet(self, kBg, color); else NigStoreRemove(self, kBg);
     tInHook = YES;
@@ -1007,6 +1099,7 @@ static void HookedLayerSetBackgroundColor(CALayer *self, SEL _cmd, CGColorRef co
         OrigLayerSetBackgroundColor(self, _cmd, color);
         return;
     }
+    gSampleEpoch++;
     NigStoreSet(self, kLayerBg, @{@"orig": orig, @"out": want});
     tInHook = YES;
     OrigLayerSetBackgroundColor(self, _cmd, want.CGColor);
@@ -1017,8 +1110,9 @@ static void HookedLayerSetBackgroundColor(CALayer *self, SEL _cmd, CGColorRef co
 // colours are only lightened while the view draws onto a surface Nig made dark.
 static void HookedDrawLayerInContext(UIView *self, SEL _cmd, CALayer *layer, CGContextRef ctx) {
     int previous = tDrawState;
-    if (gDarkModeActive && !tInHook && [NSThread isMainThread]) {
-        tDrawState = (!NigIsSystemUI(self) && NigBackdropOf(self) == NigBackdropDark) ? 1 : 2;
+    if (gDarkModeActive && (!tInHook || tSampling) && [NSThread isMainThread]) {
+        tDrawState = (!NigIsSystemUI(self) &&
+                      (tSampling ? NigBackdropOf(self) : NigTextBackdrop(self)) == NigBackdropDark) ? 1 : 2;
     } else {
         tDrawState = 2;
     }
@@ -1030,7 +1124,7 @@ static void HookedDrawLayerInContext(UIView *self, SEL _cmd, CALayer *layer, CGC
 // counterpart, but only while a view draws onto a dark surface (tDrawState 1).
 // Light colours are untouched.
 static void HookedSetFillColor(CGContextRef ctx, CGColorRef color) {
-    if (gDarkModeActive && color && !tInHook && tDrawState == 1) {
+    if (gDarkModeActive && color && (!tInHook || tSampling) && tDrawState == 1) {
         CGColorRef mapped = NigCopyTransformedCGColor(color, NigRoleText);
         if (mapped) {
             OrigSetFillColor(ctx, mapped);
@@ -1042,7 +1136,7 @@ static void HookedSetFillColor(CGContextRef ctx, CGColorRef color) {
 }
 
 static void HookedSetStrokeColor(CGContextRef ctx, CGColorRef color) {
-    if (gDarkModeActive && color && !tInHook && tDrawState == 1) {
+    if (gDarkModeActive && color && (!tInHook || tSampling) && tDrawState == 1) {
         CGColorRef mapped = NigCopyTransformedCGColor(color, NigRoleText);
         if (mapped) {
             OrigSetStrokeColor(ctx, mapped);
