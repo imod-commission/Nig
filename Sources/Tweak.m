@@ -20,6 +20,7 @@
 #import <objc/runtime.h>
 #import <os/lock.h>
 #import <os/log.h>
+#import <notify.h>
 #import <substrate.h>
 
 #pragma mark - Logging
@@ -39,8 +40,6 @@ static os_log_t TweakLog(void) {
 static BOOL gDarkModeActive = NO;
 static BOOL gEverActive = NO;
 static BOOL gRefreshPending = NO;
-static BOOL gSystemDarkSeen = NO;
-static CFAbsoluteTime gLastRefreshTime = 0;
 // Set while Nig itself changes a property, so the hooks let it through.
 static __thread BOOL tInHook = NO;
 // While a view draws itself: 1 = it sits on a surface Nig made dark, 2 = it does not,
@@ -230,25 +229,48 @@ static BOOL NigIsSystemUI(UIView *view) {
     return NO;
 }
 
+// An app's own traits cannot tell the system style: an app locked to light
+// mode sees light everywhere. SpringBoard (which Nig also loads into) always
+// knows, and publishes it as the state of a Darwin notification that any
+// sandboxed app can read. 0 = not published yet, 1 = light, 2 = dark.
+static const char *const kStyleNotification = "com.imodcommission.nig.style";
+
+static int NigPublishedStyle(void) {
+    static int token = NOTIFY_TOKEN_INVALID;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (notify_register_check(kStyleNotification, &token) != NOTIFY_STATUS_OK) token = NOTIFY_TOKEN_INVALID;
+    });
+    if (token == NOTIFY_TOKEN_INVALID) return 0;
+    uint64_t state = 0;
+    if (notify_get_state(token, &state) != NOTIFY_STATUS_OK) return 0;
+    return (int)state;
+}
+
+static void NigPublishStyleIfChanged(void) {
+    static int token = NOTIFY_TOKEN_INVALID;
+    static uint64_t last = 0;
+    if (token == NOTIFY_TOKEN_INVALID &&
+        notify_register_check(kStyleNotification, &token) != NOTIFY_STATUS_OK) {
+        token = NOTIFY_TOKEN_INVALID;
+        return;
+    }
+    uint64_t now = ([UIScreen mainScreen].traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? 2 : 1;
+    if (now == last) return;
+    last = now;
+    notify_set_state(token, now);
+    notify_post(kStyleNotification);
+    os_log(TweakLog(), "ApelinPublished style=%llu", now);
+}
+
 static BOOL NigSystemIsDark(BOOL allowScreen) {
+    int published = NigPublishedStyle();
+    if (published != 0) return published == 2;
+    // SpringBoard has not published yet (it loads Nig only after a respring):
+    // fall back to what the app itself can see.
     BOOL dark = NO;
-    // The global domain is readable from an app's sandbox.
-    CFPropertyListRef v = CFPreferencesCopyValue(CFSTR("AppleInterfaceStyle"),
-                                                 kCFPreferencesAnyApplication,
-                                                 kCFPreferencesCurrentUser,
-                                                 kCFPreferencesAnyHost);
-    if (v) {
-        if (CFGetTypeID(v) == CFStringGetTypeID()) {
-            dark = (CFStringCompare((CFStringRef)v, CFSTR("Dark"), 0) == kCFCompareEqualTo);
-        }
-        CFRelease(v);
-    }
-    if (!dark) {
-        // An app locked to light mode still sees the system's own setting here,
-        // which the screen's and the windows' traits no longer show.
-        id style = [[NSUserDefaults standardUserDefaults] objectForKey:@"AppleInterfaceStyle"];
-        if ([style isKindOfClass:[NSString class]]) dark = [style isEqualToString:@"Dark"];
-    }
+    id style = [[NSUserDefaults standardUserDefaults] objectForKey:@"AppleInterfaceStyle"];
+    if ([style isKindOfClass:[NSString class]]) dark = [style isEqualToString:@"Dark"];
     if (!dark && allowScreen) {
         dark = ([UIScreen mainScreen].traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
     }
@@ -815,32 +837,10 @@ static UIWindow *NigProbeWindow(NSMutableArray<UIWindow *> *all) {
     return probe;
 }
 
-// Does the app itself paint its main surface dark? The window's trait is not
-// proof: an app with hard-coded light colours that never opted out of dark
-// mode still gets a dark trait while looking light. So look at the first
-// opaque background below the root view (the app's own colour, as it was
-// before Nig touched it) and judge its luminance.
-static BOOL NigAppRendersDark(UIWindow *window) {
-    UIView *start = window.rootViewController.view ?: window;
-    NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:start];
-    NSUInteger visited = 0;
-    while (queue.count && visited < 60) {
-        UIView *v = queue.firstObject;
-        [queue removeObjectAtIndex:0];
-        visited++;
-        if ([v isKindOfClass:[UIImageView class]] || [v isKindOfClass:[UIVisualEffectView class]]) continue;
-        UIColor *bg = NigStoreGet(v, kBg) ?: v.backgroundColor;
-        CGFloat r, g, b, a;
-        if (bg && NigGetRGBA(bg, &r, &g, &b, &a) && a >= 0.6) {
-            return NigLuma(r, g, b) < 0.4;
-        }
-        for (UIView *sub in v.subviews) {
-            if (!sub.hidden && sub.alpha > 0.1) [queue addObject:sub];
-        }
-    }
-    return NO;  // no surface colour found: act, the transforms leave dark content alone
-}
-
+// Nig only follows the system's style. Whether an app supports dark mode is
+// not its business: a user who does not want an app touched turns the
+// injection off for it (Choicy). An app that already renders dark is left
+// alone by the transforms themselves (dark colours stay, only light ones move).
 static void NigRefresh(void) {
     NSMutableArray<UIWindow *> *windows = [NSMutableArray array];
     UIWindow *probe = NigProbeWindow(windows);
@@ -850,21 +850,15 @@ static void NigRefresh(void) {
     // Dynamic colours are read the way the app itself resolves them.
     BOOL traitDark = (probe.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
     NigSetResolveStyle(traitDark ? UIUserInterfaceStyleDark : UIUserInterfaceStyleLight);
-    // An app that really renders dark (follows the system, or has its own dark
-    // theme) needs no help. A light trait means it renders light; a dark trait
-    // needs the surface check above.
-    BOOL appDark = traitDark && NigAppRendersDark(probe);
-    BOOL active = system && !appDark;
+    BOOL active = system;
 
     static int lastSig = -1;
-    int sig = (system ? 1 : 0) | (traitDark ? 2 : 0) | (appDark ? 4 : 0);
+    int sig = (system ? 1 : 0) | (traitDark ? 2 : 0);
     if (sig != lastSig) {
         lastSig = sig;
-        os_log(TweakLog(), "ApelinState active=%d system=%d traitDark=%d appDark=%d %{public}s",
-               active, system, traitDark, appDark, getprogname());
+        os_log(TweakLog(), "ApelinState active=%d system=%d published=%d traitDark=%d %{public}s",
+               active, system, NigPublishedStyle(), traitDark, getprogname());
     }
-    gSystemDarkSeen = system;
-    gLastRefreshTime = CFAbsoluteTimeGetCurrent();
     gDarkModeActive = active;
     if (active) gEverActive = YES;
     if (!gEverActive) return;  // nothing was ever changed, nothing to restore
@@ -938,11 +932,6 @@ static void HookedDidMoveToWindow(UIView *self, SEL _cmd) {
     OrigDidMoveToWindow(self, _cmd);
     if (self.window && gDarkModeActive && [NSThread isMainThread] && !tInHook) {
         NigApplySelf(self);
-    } else if (self.window && !gDarkModeActive && gSystemDarkSeen && [NSThread isMainThread] && !tInHook &&
-               CFAbsoluteTimeGetCurrent() - gLastRefreshTime > 1.0) {
-        // Not active yet (a splash screen or a dark first page was judged): the
-        // app may have moved on, so judge again as its UI changes.
-        NigRequestRefresh();
     }
 }
 
@@ -1095,6 +1084,20 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     // the package id's subsystem. Keep the line, and keep it public.
     os_log(TweakLog(), "ApelinLoaded %{public}s in %{public}s", APELIN_BUILD_ID, getprogname());
 
+    if ([[NSBundle mainBundle].bundleIdentifier isEqualToString:@"com.apple.springboard"]) {
+        // SpringBoard only reports the system style; it recolours nothing.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NigPublishStyleIfChanged();
+            dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+            dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                                      NSEC_PER_SEC, NSEC_PER_SEC / 4);
+            dispatch_source_set_event_handler(timer, ^{ NigPublishStyleIfChanged(); });
+            dispatch_resume(timer);
+            static dispatch_source_t keep;
+            keep = timer;
+        });
+        return;
+    }
     if (!NigShouldRunInThisProcess()) return;
 
     MSHookMessageEx([UIView class], @selector(setBackgroundColor:),
@@ -1121,6 +1124,10 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     // UIApplication never had -application:didFinishLaunchingWithOptions: (it
     // is the delegate's), so the old hook on it never ran. Notifications are
     // the reliable trigger; the system style is read once the app is up.
+    int styleToken = NOTIFY_TOKEN_INVALID;
+    notify_register_dispatch(kStyleNotification, &styleToken, dispatch_get_main_queue(), ^(int t __unused) {
+        NigRequestRefresh();
+    });
     NigObserve(UIApplicationDidFinishLaunchingNotification, 0.6);
     NigObserve(UIApplicationWillEnterForegroundNotification, 0.0);
     NigObserve(UIApplicationDidBecomeActiveNotification, 0.6);
