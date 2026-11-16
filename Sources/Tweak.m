@@ -679,22 +679,50 @@ static UIWindow *NigProbeWindow(NSMutableArray<UIWindow *> *all) {
     return probe;
 }
 
+// Does the app itself paint its main surface dark? The window's trait is not
+// proof: an app with hard-coded light colours that never opted out of dark
+// mode still gets a dark trait while looking light. So look at the first
+// opaque background below the root view (the app's own colour, as it was
+// before Nig touched it) and judge its luminance.
+static BOOL NigAppRendersDark(UIWindow *window) {
+    UIView *start = window.rootViewController.view ?: window;
+    NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:start];
+    NSUInteger visited = 0;
+    while (queue.count && visited < 60) {
+        UIView *v = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        visited++;
+        if ([v isKindOfClass:[UIImageView class]] || [v isKindOfClass:[UIVisualEffectView class]]) continue;
+        UIColor *bg = NigStoreGet(v, kBg) ?: v.backgroundColor;
+        CGFloat r, g, b, a;
+        if (bg && NigGetRGBA(bg, &r, &g, &b, &a) && a >= 0.6) {
+            return NigLuma(r, g, b) < 0.4;
+        }
+        for (UIView *sub in v.subviews) {
+            if (!sub.hidden && sub.alpha > 0.1) [queue addObject:sub];
+        }
+    }
+    return NO;  // no surface colour found: act, the transforms leave dark content alone
+}
+
 static void NigRefresh(void) {
     NSMutableArray<UIWindow *> *windows = [NSMutableArray array];
     UIWindow *probe = NigProbeWindow(windows);
     if (!probe) return;  // no window yet: a later notification retries
 
     BOOL system = NigSystemIsDark(YES);
-    // An app that renders dark by itself (system style or its own toggle)
-    // needs no help; the window's trait says what the app really renders.
-    BOOL appDark = (probe.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
-    BOOL active = system && !appDark;
     // Dynamic colours are read the way the app itself resolves them.
-    NigSetResolveStyle(appDark ? UIUserInterfaceStyleDark : UIUserInterfaceStyleLight);
+    BOOL traitDark = (probe.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    NigSetResolveStyle(traitDark ? UIUserInterfaceStyleDark : UIUserInterfaceStyleLight);
+    // An app that really renders dark (follows the system, or has its own dark
+    // theme) needs no help. A light trait means it renders light; a dark trait
+    // needs the surface check above.
+    BOOL appDark = traitDark && NigAppRendersDark(probe);
+    BOOL active = system && !appDark;
 
     if (active != gDarkModeActive) {
-        os_log(TweakLog(), "ApelinState active=%d system=%d appDark=%d %{public}s",
-               active, system, appDark, getprogname());
+        os_log(TweakLog(), "ApelinState active=%d system=%d traitDark=%d appDark=%d %{public}s",
+               active, system, traitDark, appDark, getprogname());
     }
     gDarkModeActive = active;
     if (active) gEverActive = YES;
