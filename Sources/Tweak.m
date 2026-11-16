@@ -451,7 +451,9 @@ static BOOL NigSampleBehind(UIView *view, CGFloat *mean, CGFloat *spread) {
 // For text and glyphs: the backdrop as it looks, falling back to the model
 // (NigBackdropOf) when it cannot be read.
 static NigBackdrop NigTextBackdrop(UIView *view) {
-    if (view.window && [NSThread isMainThread]) {
+    CGSize size = view.bounds.size;
+    BOOL small = size.height <= 120 && size.width * size.height <= 60000;  // a big view has no single backdrop
+    if (small && view.window && [NSThread isMainThread]) {
         for (UIView *v = view; v; v = v.superview) {
             if ([v isKindOfClass:[UIVisualEffectView class]]) return NigBackdropDark;  // bars are forced dark
         }
@@ -843,6 +845,67 @@ static BOOL NigWantsDarkOverride(UIView *view) {
            [view isKindOfClass:[UIToolbar class]];
 }
 
+#pragma mark - Views that draw text as pixels
+
+// Some views put their text (and glyph-like shapes) into a bitmap with their
+// own drawing code: SwiftUI's CGDrawingView, or any app view that overrides
+// drawLayer:inContext:. No colour reaches Nig there, so the layer itself is
+// flipped by the compositor: invert plus a 180 degree hue turn, which swaps
+// light and dark while keeping the hue (dark navy becomes pale blue).
+static NSString *const kInverted = @"inverted";
+static void (*OrigDrawLayerInContext)(UIView *, SEL, CALayer *, CGContextRef);
+static void HookedDrawLayerInContext(UIView *self, SEL _cmd, CALayer *layer, CGContextRef ctx);
+
+static BOOL NigDrawsOwnBitmap(UIView *view) {
+    static NSMutableDictionary<NSString *, NSNumber *> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    Class cls = [view class];
+    NSString *name = NSStringFromClass(cls);
+    NSNumber *known = cache[name];
+    if (known) return known.boolValue;
+    BOOL result = NO;
+    if ([name containsString:@"CGDrawingView"]) {
+        result = YES;
+    } else {
+        IMP imp = class_getMethodImplementation(cls, @selector(drawLayer:inContext:));
+        if (imp != (IMP)OrigDrawLayerInContext && imp != (IMP)HookedDrawLayerInContext) {
+            const char *image = class_getImageName(cls);
+            result = image && strncmp(image, "/System/", 8) != 0 && strncmp(image, "/usr/lib/", 9) != 0;
+        }
+    }
+    cache[name] = @(result);
+    return result;
+}
+
+static NSArray *NigInvertFilters(void) {
+    Class cafilter = NSClassFromString(@"CAFilter");
+    if (!cafilter || ![cafilter respondsToSelector:@selector(filterWithType:)]) return nil;
+    id invert = [cafilter performSelector:@selector(filterWithType:) withObject:@"colorInvert"];
+    id hue = [cafilter performSelector:@selector(filterWithType:) withObject:@"colorHueRotate"];
+    if (!invert || !hue) return nil;
+    [hue setValue:@(M_PI) forKey:@"inputAngle"];
+    return @[invert, hue];
+}
+
+static void NigApplyBitmapFilter(UIView *view, BOOL active) {
+    BOOL want = active && gResolveStyle != UIUserInterfaceStyleDark &&  // an app already rendering dark stays
+                NigTextBackdrop(view) == NigBackdropDark;
+    NSDictionary *rec = NigStoreGet(view, kInverted);
+    CALayer *layer = view.layer;
+    if (want && !rec) {
+        NSArray *ours = NigInvertFilters();
+        if (!ours) return;
+        NSArray *before = layer.filters ?: @[];
+        NigStoreSet(view, kInverted, @{@"before": before});
+        layer.filters = [before arrayByAddingObjectsFromArray:ours];
+    } else if (!want && rec) {
+        NSArray *before = rec[@"before"];
+        layer.filters = before.count ? before : nil;
+        NigStoreRemove(view, kInverted);
+    }
+}
+
 static void NigApplySelf(UIView *view) {
     if (!view || NigIsSystemUI(view)) return;
     BOOL active = gDarkModeActive;
@@ -885,6 +948,7 @@ static void NigApplySelf(UIView *view) {
         NigApplyImageView((UIImageView *)view, active);
     }
     NigApplyTextLayers(view, active);
+    if (NigDrawsOwnBitmap(view)) NigApplyBitmapFilter(view, active);
 
     // The window's tint is inherited by every view below it; touching each
     // subview's tint would break that inheritance.
@@ -1110,7 +1174,9 @@ static void HookedLayerSetBackgroundColor(CALayer *self, SEL _cmd, CGColorRef co
 // colours are only lightened while the view draws onto a surface Nig made dark.
 static void HookedDrawLayerInContext(UIView *self, SEL _cmd, CALayer *layer, CGContextRef ctx) {
     int previous = tDrawState;
-    if (gDarkModeActive && (!tInHook || tSampling) && [NSThread isMainThread]) {
+    if (gDarkModeActive && !tSampling && NigDrawsOwnBitmap(self)) {
+        tDrawState = 2;  // flipped as a whole by NigApplyBitmapFilter
+    } else if (gDarkModeActive && (!tInHook || tSampling) && [NSThread isMainThread]) {
         tDrawState = (!NigIsSystemUI(self) &&
                       (tSampling ? NigBackdropOf(self) : NigTextBackdrop(self)) == NigBackdropDark) ? 1 : 2;
     } else {
