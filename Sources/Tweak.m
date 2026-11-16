@@ -46,11 +46,6 @@ static __thread BOOL tInHook = NO;
 // 0 = not inside a view's drawLayer:inContext: at all. Core Graphics colour
 // hooks only act in state 1, so glyphs are never lightened over a light surface.
 static __thread int tDrawState = 0;
-// Set while Nig renders the window to look at the pixels behind a view: the
-// drawing it triggers must still be recoloured like any other drawing.
-static __thread BOOL tSampling = NO;
-// Bumped whenever a surface colour changes, which invalidates sampled backdrops.
-static NSUInteger gSampleEpoch = 0;
 // How the app itself resolves dynamic colours: dark when the app follows the
 // system appearance (its dynamic colours are then already dark), light when it
 // is locked to light. Fixed by the window's real trait in NigRefresh.
@@ -64,9 +59,9 @@ typedef NS_ENUM(NSInteger, NigRole) {
 };
 
 typedef NS_ENUM(NSInteger, NigBackdrop) {
-    NigBackdropDark,   // a solid colour Nig has made dark (or nothing known)
-    NigBackdropLight,  // a solid colour that is still light
-    NigBackdropMedia,  // image, gradient, custom drawing: leave text alone
+    NigBackdropDark,   // a solid surface known to be dark
+    NigBackdropLight,  // a solid surface known to be light
+    NigBackdropMedia,  // image, gradient, custom drawing, or unknown: do not guess
 };
 
 #pragma mark - Colour maths
@@ -379,92 +374,14 @@ static NigBackdrop NigBackdropOf(UIView *view) {
             }
         }
     }
-    return NigBackdropDark;
-}
-
-// What is really behind a view, by looking: the window is rendered with the
-// view hidden, into a few pixels covering the view's frame. The app's own
-// colours and Nig's both show up there, so text follows what is directly under
-// it: dark underneath becomes light text, light underneath keeps dark text.
-// Returns NO when nothing reliable can be read (nothing drawn there, GPU content).
-static BOOL NigSampleBehind(UIView *view, CGFloat *mean, CGFloat *spread) {
-    UIWindow *window = view.window;
-    if (!window || view.bounds.size.width < 1 || view.bounds.size.height < 1) return NO;
-    CGRect r = CGRectIntersection([view convertRect:view.bounds toView:window], window.bounds);
-    if (CGRectIsNull(r) || r.size.width < 1 || r.size.height < 1) return NO;
-
-    NSDictionary *cached = NigStoreGet(view, @"behind");
-    if (cached && [cached[@"epoch"] unsignedIntegerValue] == gSampleEpoch &&
-        CGRectEqualToRect(CGRectIntegral(r), CGRectIntegral(CGRectFromString(cached[@"rect"])))) {
-        if (![cached[@"ok"] boolValue]) return NO;
-        *mean = [cached[@"mean"] doubleValue];
-        *spread = [cached[@"spread"] doubleValue];
-        return YES;
-    }
-
-    enum { N = 4 };
-    uint8_t px[N * N * 4];
-    memset(px, 0, sizeof(px));
-    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGContextRef ctx = CGBitmapContextCreate(px, N, N, 8, N * 4, cs,
-                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-    CGColorSpaceRelease(cs);
-    if (!ctx) return NO;
-    CGContextTranslateCTM(ctx, 0, N);
-    CGContextScaleCTM(ctx, 1, -1);  // UIKit's orientation
-    CGContextScaleCTM(ctx, N / r.size.width, N / r.size.height);
-    CGContextTranslateCTM(ctx, -r.origin.x, -r.origin.y);
-
-    BOOL previousInHook = tInHook, previousSampling = tSampling;
-    tInHook = YES;
-    tSampling = YES;
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    BOOL wasHidden = view.layer.hidden;
-    view.layer.hidden = YES;
-    [window.layer renderInContext:ctx];
-    view.layer.hidden = wasHidden;
-    [CATransaction commit];
-    tSampling = previousSampling;
-    tInHook = previousInHook;
-    CGContextRelease(ctx);
-
-    double sum = 0, lo = 1, hi = 0;
-    int covered = 0;
-    for (int i = 0; i < N * N; i++) {
-        double a = px[i * 4 + 3] / 255.0;
-        if (a < 0.9) continue;
-        covered++;
-        double l = NigLuma(px[i * 4] / 255.0 / a, px[i * 4 + 1] / 255.0 / a, px[i * 4 + 2] / 255.0 / a);
-        sum += l; lo = MIN(lo, l); hi = MAX(hi, l);
-    }
-    BOOL ok = covered >= (N * N * 3) / 4;
-    CGFloat m = ok ? sum / covered : 0, sp = ok ? hi - lo : 0;
-    NigStoreSet(view, @"behind", @{@"epoch": @(gSampleEpoch), @"rect": NSStringFromCGRect(CGRectIntegral(r)),
-                                   @"time": @(CACurrentMediaTime()), @"ok": @(ok), @"mean": @(m), @"spread": @(sp)});
-    if (!ok) return NO;
-    *mean = m; *spread = sp;
-    return YES;
-}
-
-// For text and glyphs: the backdrop as it looks, falling back to the model
-// (NigBackdropOf) when it cannot be read.
-static NigBackdrop NigTextBackdrop(UIView *view) {
-    // The model is cheap and gives the same answer every time. Pixels are only
-    // read when it cannot tell (a photo, a gradient or a banner behind).
-    NigBackdrop model = NigBackdropOf(view);
-    if (model != NigBackdropMedia) return model;
-    CGSize size = view.bounds.size;
-    BOOL small = size.height <= 120 && size.width * size.height <= 60000;  // a big view has no single backdrop
-    if (small && view.window && [NSThread isMainThread]) {
-        CGFloat mean, spread;
-        if (NigSampleBehind(view, &mean, &spread)) {
-            if (spread > 0.45) return NigBackdropMedia;
-            if (mean < 0.45) return NigBackdropDark;
-            if (mean > 0.55) return NigBackdropLight;
-        }
-    }
     return NigBackdropMedia;
+}
+
+// Use only stable, explicit surface information. Rendering the entire window
+// separately for every small text view is costly and can race page transitions;
+// images, gradients and unclassified custom drawing stay untouched.
+static NigBackdrop NigTextBackdrop(UIView *view) {
+    return NigBackdropOf(view);
 }
 
 #pragma mark - Decisions
@@ -481,29 +398,56 @@ static UIColor *NigDesiredText(UIView *view, UIColor *orig) {
 }
 
 static NSAttributedString *NigTransformAttr(NSAttributedString *attr, UIView *view) {
-    if (attr.length == 0 || NigTextBackdrop(view) != NigBackdropDark) return attr;
+    if (attr.length == 0) return attr;
+    BOOL darkSurface = NigTextBackdrop(view) == NigBackdropDark;
     __block NSMutableAttributedString *m = nil;
-    [attr enumerateAttribute:NSForegroundColorAttributeName
-                     inRange:NSMakeRange(0, attr.length)
-                     options:0
-                  usingBlock:^(id value, NSRange range, BOOL *stop __unused) {
-        if (![value isKindOfClass:[UIColor class]]) return;
-        UIColor *n = NigTransformColor(value, NigRoleText);
-        if (!n) return;
-        if (!m) m = [attr mutableCopy];
-        [m addAttribute:NSForegroundColorAttributeName value:n range:range];
-    }];
+    void (^mapAttribute)(NSString *, NigRole) = ^(NSString *key, NigRole role) {
+        [attr enumerateAttribute:key
+                         inRange:NSMakeRange(0, attr.length)
+                         options:0
+                      usingBlock:^(id value, NSRange range, BOOL *stop __unused) {
+            if (![value isKindOfClass:[UIColor class]]) return;
+            UIColor *mapped = NigTransformColor(value, role);
+            if (!mapped || [mapped isEqual:value]) return;
+            if (!m) m = [attr mutableCopy];
+            [m addAttribute:key value:mapped range:range];
+        }];
+    };
+
+    if (darkSurface) {
+        mapAttribute(NSForegroundColorAttributeName, NigRoleText);
+        mapAttribute(NSUnderlineColorAttributeName, NigRoleText);
+        mapAttribute(NSStrikethroughColorAttributeName, NigRoleText);
+        mapAttribute(NSStrokeColorAttributeName, NigRoleText);
+    }
+    // Explicit run backgrounds (selection/highlight pills) are surfaces too;
+    // map them even when the surrounding view has no solid background.
+    if (gDarkModeActive) mapAttribute(NSBackgroundColorAttributeName, NigRoleBackground);
     return m ?: attr;
 }
 
 // YES when some run carries a colour other than the label's own textColor.
 static BOOL NigAttrHasCustomColors(NSAttributedString *attr, UIColor *base) {
     __block BOOL custom = NO;
-    [attr enumerateAttribute:NSForegroundColorAttributeName
+    NSArray<NSString *> *textKeys = @[NSForegroundColorAttributeName, NSUnderlineColorAttributeName,
+                                      NSStrikethroughColorAttributeName, NSStrokeColorAttributeName];
+    for (NSString *key in textKeys) {
+        [attr enumerateAttribute:key
+                         inRange:NSMakeRange(0, attr.length)
+                         options:0
+                      usingBlock:^(id value, NSRange range __unused, BOOL *stop) {
+            if ([value isKindOfClass:[UIColor class]] && ![value isEqual:base]) {
+                custom = YES;
+                *stop = YES;
+            }
+        }];
+        if (custom) return YES;
+    }
+    [attr enumerateAttribute:NSBackgroundColorAttributeName
                      inRange:NSMakeRange(0, attr.length)
                      options:0
                   usingBlock:^(id value, NSRange range __unused, BOOL *stop) {
-        if ([value isKindOfClass:[UIColor class]] && ![value isEqual:base]) {
+        if ([value isKindOfClass:[UIColor class]]) {
             custom = YES;
             *stop = YES;
         }
@@ -522,7 +466,7 @@ static void NigSyncColor(UIView *view, NSString *key, UIColor *current, BOOL act
     UIColor *want = active ? (desired(orig) ?: orig) : orig;
     if (active && want != orig) NigStoreSet(view, key, orig);
     else NigStoreRemove(view, key);
-    if (current != want && ![current isEqual:want]) { gSampleEpoch++; set(want); }
+    if (current != want && ![current isEqual:want]) set(want);
 }
 
 static void NigApplyLabel(UILabel *label, BOOL active) {
@@ -583,7 +527,6 @@ static void NigApplyTextInput(UIView *view, BOOL active) {
                      ^UIColor *(UIColor *o) { return NigDesiredText(view, o); },
                      ^(UIColor *c) { t.textColor = c; });
 
-        // Placeholder runs keep their own colour unless they are dark.
         NSAttributedString *ph = t.attributedPlaceholder;
         NSAttributedString *phOut = NigStoreGet(view, kPlaceholderOut);
         BOOL ours = phOut && ph && [ph isEqualToAttributedString:phOut];
@@ -603,23 +546,31 @@ static void NigApplyTextInput(UIView *view, BOOL active) {
         appearance = t.keyboardAppearance;
     } else if ([view isKindOfClass:[UITextView class]]) {
         UITextView *t = (UITextView *)view;
-        if (t.textStorage.length == 0) {
-            NigSyncColor(view, kText, t.textColor, active,
-                         ^UIColor *(UIColor *o) { return NigDesiredText(view, o); },
-                         ^(UIColor *c) { t.textColor = c; });
-        } else if (active) {
-            // Per run, in place: setting textColor would flatten the styling.
-            NSTextStorage *storage = t.textStorage;
-            [storage beginEditing];
-            [storage enumerateAttribute:NSForegroundColorAttributeName
-                                inRange:NSMakeRange(0, storage.length)
-                                options:0
-                             usingBlock:^(id value, NSRange range, BOOL *stop __unused) {
-                if (![value isKindOfClass:[UIColor class]]) return;
-                UIColor *n = NigDesiredText(view, value);
-                if (n) [storage addAttribute:NSForegroundColorAttributeName value:n range:range];
-            }];
-            [storage endEditing];
+        NigSyncColor(view, kText, t.textColor, active,
+                     ^UIColor *(UIColor *o) { return NigDesiredText(view, o); },
+                     ^(UIColor *c) { t.textColor = c; });
+
+        NSAttributedString *current = t.attributedText;
+        NSAttributedString *savedOut = NigStoreGet(view, @"textInputAttrOut");
+        NSAttributedString *savedOrig = NigStoreGet(view, @"textInputAttr");
+        BOOL ours = savedOut && current && [current isEqualToAttributedString:savedOut];
+        NSAttributedString *orig = ours ? savedOrig : current;
+        NSAttributedString *want = active ? NigTransformAttr(orig, view) : orig;
+        BOOL changed = want && orig && ![want isEqualToAttributedString:orig];
+        if (active && changed) {
+            NigStoreSet(view, @"textInputAttr", orig);
+            NigStoreSet(view, @"textInputAttrOut", want);
+        } else {
+            NigStoreRemove(view, @"textInputAttr");
+            NigStoreRemove(view, @"textInputAttrOut");
+        }
+        if (want && (!current || ![current isEqualToAttributedString:want])) {
+            NSRange selection = t.selectedRange;
+            t.attributedText = want;
+            if (selection.location != NSNotFound && selection.location <= want.length) {
+                selection.length = MIN(selection.length, want.length - selection.location);
+                t.selectedRange = selection;
+            }
         }
         hasKeyboard = YES;
         appearance = t.keyboardAppearance;
@@ -754,10 +705,10 @@ static void NigSyncLayerColor(CALayer *layer, NSString *key, CGColorRef current,
     if (!orig) return;
     UIColor *want = active ? NigTransformColor(orig, role) : nil;
     if (want) {
-        if (!(cur && [cur isEqual:want])) { gSampleEpoch++; set(want.CGColor); }
+        if (!(cur && [cur isEqual:want])) set(want.CGColor);
         NigStoreSet(layer, key, @{@"orig": orig, @"out": want});
     } else {
-        if (rec && ![orig isEqual:cur]) { gSampleEpoch++; set(orig.CGColor); }
+        if (rec && ![orig isEqual:cur]) set(orig.CGColor);
         NigStoreRemove(layer, key);
     }
 }
@@ -846,35 +797,24 @@ static BOOL NigWantsDarkOverride(UIView *view) {
 
 #pragma mark - Views that draw text as pixels
 
-// Some views put their text (and glyph-like shapes) into a bitmap with their
-// own drawing code: SwiftUI's CGDrawingView, or any app view that overrides
-// drawLayer:inContext:. No colour reaches Nig there, so the layer itself is
-// flipped by the compositor: invert plus a 180 degree hue turn, which swaps
-// light and dark while keeping the hue (dark navy becomes pale blue).
+// SwiftUI can rasterize a text run in a private CGDrawingView. Only that
+// known renderer is eligible; custom app drawLayer implementations may contain
+// photos, logos or whole screens and must never be inverted as a unit.
 static NSString *const kInverted = @"inverted";
 static void (*OrigDrawLayerInContext)(UIView *, SEL, CALayer *, CGContextRef);
 static void HookedDrawLayerInContext(UIView *self, SEL _cmd, CALayer *layer, CGContextRef ctx);
 
 static BOOL NigDrawsOwnBitmap(UIView *view) {
-    static NSMutableDictionary<NSString *, NSNumber *> *cache;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
-    Class cls = [view class];
-    NSString *name = NSStringFromClass(cls);
-    NSNumber *known = cache[name];
-    if (known) return known.boolValue;
-    BOOL result = NO;
-    if ([name containsString:@"CGDrawingView"]) {
-        result = YES;
-    } else {
-        IMP imp = class_getMethodImplementation(cls, @selector(drawLayer:inContext:));
-        if (imp != (IMP)OrigDrawLayerInContext && imp != (IMP)HookedDrawLayerInContext) {
-            const char *image = class_getImageName(cls);
-            result = image && strncmp(image, "/System/", 8) != 0 && strncmp(image, "/usr/lib/", 9) != 0;
-        }
-    }
-    cache[name] = @(result);
-    return result;
+    return [NSStringFromClass([view class]) containsString:@"CGDrawingView"];
+}
+
+static BOOL NigShouldFilterBitmap(UIView *view, BOOL active) {
+    CGSize size = view.bounds.size;
+    BOOL isolated = NigDrawsOwnBitmap(view) && size.height > 0 && size.height <= 120 &&
+                    size.width * size.height <= 60000 && view.subviews.count == 0 &&
+                    !view.backgroundColor && !view.layer.backgroundColor;
+    return active && isolated && gResolveStyle != UIUserInterfaceStyleDark &&
+           NigTextBackdrop(view) == NigBackdropDark;
 }
 
 static NSArray *NigInvertFilters(void) {
@@ -888,19 +828,27 @@ static NSArray *NigInvertFilters(void) {
 }
 
 static void NigApplyBitmapFilter(UIView *view, BOOL active) {
-    BOOL want = active && gResolveStyle != UIUserInterfaceStyleDark &&  // an app already rendering dark stays
-                NigTextBackdrop(view) == NigBackdropDark;
+    BOOL want = NigShouldFilterBitmap(view, active);
     NSDictionary *rec = NigStoreGet(view, kInverted);
     CALayer *layer = view.layer;
     if (want && !rec) {
         NSArray *ours = NigInvertFilters();
         if (!ours) return;
-        NSArray *before = layer.filters ?: @[];
-        NigStoreSet(view, kInverted, @{@"before": before});
-        layer.filters = [before arrayByAddingObjectsFromArray:ours];
+        NSMutableArray *combined = [NSMutableArray arrayWithArray:layer.filters ?: @[]];
+        [combined addObjectsFromArray:ours];
+        NigStoreSet(view, kInverted, @{ @"ours": ours });
+        layer.filters = combined;
     } else if (!want && rec) {
-        NSArray *before = rec[@"before"];
-        layer.filters = before.count ? before : nil;
+        NSArray *ours = rec[@"ours"];
+        NSMutableArray *remaining = [NSMutableArray array];
+        for (id filter in layer.filters ?: @[]) {
+            BOOL isOurs = NO;
+            for (id oursFilter in ours) {
+                if (filter == oursFilter) { isOurs = YES; break; }
+            }
+            if (!isOurs) [remaining addObject:filter];
+        }
+        layer.filters = remaining.count ? remaining : nil;
         NigStoreRemove(view, kInverted);
     }
 }
@@ -999,7 +947,6 @@ static void NigRefresh(void) {
     UIWindow *probe = NigProbeWindow(windows);
     if (!probe) return;  // no window yet: a later notification retries
 
-    gSampleEpoch++;
     BOOL system = NigSystemIsDark(YES);
     // Dynamic colours are read the way the app itself resolves them.
     BOOL traitDark = (probe.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
@@ -1042,6 +989,8 @@ static void (*OrigLayerSetBackgroundColor)(CALayer *, SEL, CGColorRef);
 static void (*OrigDrawLayerInContext)(UIView *, SEL, CALayer *, CGContextRef);
 static void (*OrigSetFillColor)(CGContextRef, CGColorRef);
 static void (*OrigSetStrokeColor)(CGContextRef, CGColorRef);
+static void (*OrigTraitCollectionDidChange)(UIView *, SEL, UITraitCollection *);
+static void NigScheduleSettle(UIView *view);
 
 // A hook only does Nig's work on the main thread, for views Nig may touch.
 static BOOL NigShouldHandle(UIView *view) {
@@ -1055,17 +1004,20 @@ static void HookedSetBackgroundColor(UIView *self, SEL _cmd, UIColor *color) {
         OrigSetBackgroundColor(self, _cmd, color);
         return;
     }
+    UIColor *stored = NigStoreGet(self, kBg);
+    BOOL changed = stored ? ![stored isEqual:color] : ![self.backgroundColor isEqual:color];
     if (!color) {
         NigStoreRemove(self, kBg);
         OrigSetBackgroundColor(self, _cmd, color);
+        if (changed) NigScheduleSettle(self);
         return;
     }
-    gSampleEpoch++;
     UIColor *want = NigDesiredBackground(color);
     if (want) NigStoreSet(self, kBg, color); else NigStoreRemove(self, kBg);
     tInHook = YES;
     OrigSetBackgroundColor(self, _cmd, want ?: color);
     tInHook = NO;
+    if (changed) NigScheduleSettle(self);
 }
 
 static void HookedSetTintColor(UIView *self, SEL _cmd, UIColor *color) {
@@ -1074,19 +1026,19 @@ static void HookedSetTintColor(UIView *self, SEL _cmd, UIColor *color) {
         OrigSetTintColor(self, _cmd, color);
         return;
     }
-    UIColor *want = NigDesiredText(self, color);
-    if (want) NigStoreSet(self, kTint, color); else NigStoreRemove(self, kTint);
+    UIColor *stored = NigStoreGet(self, kTint);
+    UIColor *orig = (stored && [color isEqual:self.tintColor]) ? stored : color;
+    UIColor *want = NigDesiredText(self, orig);
+    if (want) NigStoreSet(self, kTint, orig); else NigStoreRemove(self, kTint);
     tInHook = YES;
-    OrigSetTintColor(self, _cmd, want ?: color);
+    OrigSetTintColor(self, _cmd, want ?: orig);
     tInHook = NO;
 }
 
-// A page change builds its views before their backgrounds and images are in
-// place, so a decision taken the moment a view arrives can be premature. The
-// arrived views are remembered and judged once more when things have been
-// quiet for a moment: one pass, no timer, nothing while the app is idle.
+// A single one-shot debounce coalesces view arrival and surface changes. It is
+// disarmed while idle; it never polls or queues a delayed block per subview.
 static NSHashTable<UIView *> *gArrived;
-static NSUInteger gSettleGeneration = 0;
+static dispatch_source_t gSettleTimer;
 
 static void NigSettleArrived(void) {
     NSArray<UIView *> *views = gArrived.allObjects;
@@ -1094,10 +1046,9 @@ static void NigSettleArrived(void) {
     if (!gDarkModeActive || views.count == 0) return;
     NSHashTable *set = [NSHashTable weakObjectsHashTable];
     for (UIView *v in views) [set addObject:v];
-    gSampleEpoch++;
     for (UIView *v in views) {
         if (!v.window) continue;
-        BOOL covered = NO;  // an ancestor is also arrived: its pass reaches this view
+        BOOL covered = NO;
         for (UIView *a = v.superview; a; a = a.superview) {
             if ([set containsObject:a]) { covered = YES; break; }
         }
@@ -1106,22 +1057,31 @@ static void NigSettleArrived(void) {
 }
 
 static void NigScheduleSettle(UIView *view) {
+    if (!view || !gDarkModeActive || ![NSThread isMainThread]) return;
     if (!gArrived) gArrived = [NSHashTable weakObjectsHashTable];
     [gArrived addObject:view];
-    NSUInteger generation = ++gSettleGeneration;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (generation == gSettleGeneration) NigSettleArrived();
-    });
+    if (!gSettleTimer) {
+        gSettleTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                               dispatch_get_main_queue());
+        dispatch_source_set_event_handler(gSettleTimer, ^{
+            dispatch_source_set_timer(gSettleTimer, DISPATCH_TIME_FOREVER,
+                                      DISPATCH_TIME_FOREVER, 0);
+            NigSettleArrived();
+        });
+        dispatch_resume(gSettleTimer);
+    }
+    dispatch_source_set_timer(gSettleTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                              DISPATCH_TIME_FOREVER, 20 * NSEC_PER_MSEC);
 }
 
-// Only this view: its subviews get their own didMoveToWindow. Walking the
-// whole subtree here was quadratic.
+// Restore detached/reused views even after the system has returned to light.
 static void HookedDidMoveToWindow(UIView *self, SEL _cmd) {
     OrigDidMoveToWindow(self, _cmd);
-    if (self.window && gDarkModeActive && [NSThread isMainThread] && !tInHook) {
+    if (self.window && (gDarkModeActive || gEverActive) &&
+        [NSThread isMainThread] && !tInHook) {
         NigApplySelf(self);
-        NigScheduleSettle(self);
+        if (gDarkModeActive) NigScheduleSettle(self);
     }
 }
 
@@ -1146,10 +1106,12 @@ static void HookedLabelSetTextColor(UILabel *self, SEL _cmd, UIColor *color) {
         OrigLabelSetTextColor(self, _cmd, color);
         return;
     }
-    UIColor *want = NigDesiredText(self, color);
-    if (want) NigStoreSet(self, kText, color); else NigStoreRemove(self, kText);
+    UIColor *stored = NigStoreGet(self, kText);
+    UIColor *orig = (stored && [color isEqual:self.textColor]) ? stored : color;
+    UIColor *want = NigDesiredText(self, orig);
+    if (want) NigStoreSet(self, kText, orig); else NigStoreRemove(self, kText);
     tInHook = YES;
-    OrigLabelSetTextColor(self, _cmd, want ?: color);
+    OrigLabelSetTextColor(self, _cmd, want ?: orig);
     tInHook = NO;
 }
 
@@ -1162,9 +1124,12 @@ static void HookedLabelSetAttributedText(UILabel *self, SEL _cmd, NSAttributedSt
         OrigLabelSetAttributedText(self, _cmd, text);
         return;
     }
-    NSAttributedString *want = NigTransformAttr(text, self);
-    if (want != text) {
-        NigStoreSet(self, kAttr, text);
+    NSAttributedString *storedOut = NigStoreGet(self, kAttrOut);
+    NSAttributedString *storedOrig = NigStoreGet(self, kAttr);
+    NSAttributedString *orig = (storedOut && [text isEqualToAttributedString:storedOut]) ? storedOrig : text;
+    NSAttributedString *want = NigTransformAttr(orig, self);
+    if (want != orig) {
+        NigStoreSet(self, kAttr, orig);
         NigStoreSet(self, kAttrOut, want);
     } else {
         NigStoreRemove(self, kAttr);
@@ -1180,7 +1145,7 @@ static void HookedLabelSetAttributedText(UILabel *self, SEL _cmd, NSAttributedSt
 // A background a layer gets from the app (or UIKit) while dark mode is on.
 // The app's colour is remembered like NigSyncLayerColor does, so it can be restored.
 static void HookedLayerSetBackgroundColor(CALayer *self, SEL _cmd, CGColorRef color) {
-    if (tInHook || !gDarkModeActive || !color || ![NSThread isMainThread] ||
+    if (tInHook || !gDarkModeActive || ![NSThread isMainThread] ||
         !NigLayerIsHandled(self) || self.contents) {
         OrigLayerSetBackgroundColor(self, _cmd, color);
         return;
@@ -1190,29 +1155,44 @@ static void HookedLayerSetBackgroundColor(CALayer *self, SEL _cmd, CGColorRef co
         OrigLayerSetBackgroundColor(self, _cmd, color);
         return;
     }
+    if (!color) {
+        BOOL changed = self.backgroundColor != NULL || NigStoreGet(self, kLayerBg) != nil;
+        NigStoreRemove(self, kLayerBg);
+        OrigLayerSetBackgroundColor(self, _cmd, color);
+        if (changed && [delegate isKindOfClass:[UIView class]]) NigScheduleSettle((UIView *)delegate);
+        return;
+    }
     UIColor *orig = [UIColor colorWithCGColor:color];
+    NSDictionary *record = NigStoreGet(self, kLayerBg);
+    UIColor *current = self.backgroundColor ? [UIColor colorWithCGColor:self.backgroundColor] : nil;
+    BOOL changed = record ? ![record[@"orig"] isEqual:orig] : ![current isEqual:orig];
     UIColor *want = NigTransformColor(orig, NigRoleBackground);
     if (!want) {
         NigStoreRemove(self, kLayerBg);
         OrigLayerSetBackgroundColor(self, _cmd, color);
+        if (changed && [delegate isKindOfClass:[UIView class]]) NigScheduleSettle((UIView *)delegate);
         return;
     }
-    gSampleEpoch++;
     NigStoreSet(self, kLayerBg, @{@"orig": orig, @"out": want});
     tInHook = YES;
     OrigLayerSetBackgroundColor(self, _cmd, want.CGColor);
     tInHook = NO;
+    if (changed && [delegate isKindOfClass:[UIView class]]) NigScheduleSettle((UIView *)delegate);
 }
 
-// Sets tDrawState for the duration of a view's own drawing: Core Graphics
-// colours are only lightened while the view draws onto a surface Nig made dark.
+// Core Graphics colour rewriting is limited to UIKit's text controls. Arbitrary
+// app drawing may mix text with backgrounds, logos and data graphics; rasterized
+// SwiftUI glyph views use the separate narrow layer-filter path above.
 static void HookedDrawLayerInContext(UIView *self, SEL _cmd, CALayer *layer, CGContextRef ctx) {
     int previous = tDrawState;
-    if (gDarkModeActive && !tSampling && NigDrawsOwnBitmap(self)) {
-        tDrawState = 2;  // flipped as a whole by NigApplyBitmapFilter
-    } else if (gDarkModeActive && (!tInHook || tSampling) && [NSThread isMainThread]) {
-        tDrawState = (!NigIsSystemUI(self) &&
-                      (tSampling ? NigBackdropOf(self) : NigTextBackdrop(self)) == NigBackdropDark) ? 1 : 2;
+    BOOL standardTextRenderer = [self isKindOfClass:[UILabel class]] ||
+                               [self isKindOfClass:[UITextField class]] ||
+                               [self isKindOfClass:[UITextView class]];
+    if (gDarkModeActive && !tInHook && NigShouldFilterBitmap(self, YES)) {
+        tDrawState = 2;  // this small rasterized glyph is recoloured by its layer filter
+    } else if (gDarkModeActive && !tInHook && [NSThread isMainThread] && standardTextRenderer &&
+               !NigIsSystemUI(self) && NigTextBackdrop(self) == NigBackdropDark) {
+        tDrawState = 1;
     } else {
         tDrawState = 2;
     }
@@ -1224,7 +1204,7 @@ static void HookedDrawLayerInContext(UIView *self, SEL _cmd, CALayer *layer, CGC
 // counterpart, but only while a view draws onto a dark surface (tDrawState 1).
 // Light colours are untouched.
 static void HookedSetFillColor(CGContextRef ctx, CGColorRef color) {
-    if (gDarkModeActive && color && (!tInHook || tSampling) && tDrawState == 1) {
+    if (gDarkModeActive && color && !tInHook && tDrawState == 1) {
         CGColorRef mapped = NigCopyTransformedCGColor(color, NigRoleText);
         if (mapped) {
             OrigSetFillColor(ctx, mapped);
@@ -1236,7 +1216,7 @@ static void HookedSetFillColor(CGContextRef ctx, CGColorRef color) {
 }
 
 static void HookedSetStrokeColor(CGContextRef ctx, CGColorRef color) {
-    if (gDarkModeActive && color && (!tInHook || tSampling) && tDrawState == 1) {
+    if (gDarkModeActive && color && !tInHook && tDrawState == 1) {
         CGColorRef mapped = NigCopyTransformedCGColor(color, NigRoleText);
         if (mapped) {
             OrigSetStrokeColor(ctx, mapped);
@@ -1245,6 +1225,13 @@ static void HookedSetStrokeColor(CGContextRef ctx, CGColorRef color) {
         }
     }
     OrigSetStrokeColor(ctx, color);
+}
+
+static void HookedTraitCollectionDidChange(UIView *self, SEL _cmd, UITraitCollection *previous) {
+    OrigTraitCollectionDidChange(self, _cmd, previous);
+    if (!previous || previous.userInterfaceStyle != self.traitCollection.userInterfaceStyle) {
+        NigPublishStyleIfChanged();
+    }
 }
 
 #pragma mark - Entry point
@@ -1279,17 +1266,12 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     os_log(TweakLog(), "ApelinLoaded %{public}s in %{public}s", APELIN_BUILD_ID, getprogname());
 
     if ([[NSBundle mainBundle].bundleIdentifier isEqualToString:@"com.apple.springboard"]) {
-        // SpringBoard only reports the system style; it recolours nothing.
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NigPublishStyleIfChanged();
-            dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-            dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
-                                      NSEC_PER_SEC, NSEC_PER_SEC / 4);
-            dispatch_source_set_event_handler(timer, ^{ NigPublishStyleIfChanged(); });
-            dispatch_resume(timer);
-            static dispatch_source_t keep;
-            keep = timer;
-        });
+        // SpringBoard publishes only when UIKit reports a real trait change;
+        // no periodic poll is left running while the device is idle.
+        MSHookMessageEx([UIView class], @selector(traitCollectionDidChange:),
+                        (IMP)HookedTraitCollectionDidChange,
+                        (IMP *)&OrigTraitCollectionDidChange);
+        dispatch_async(dispatch_get_main_queue(), ^{ NigPublishStyleIfChanged(); });
         return;
     }
     if (!NigShouldRunInThisProcess()) return;
