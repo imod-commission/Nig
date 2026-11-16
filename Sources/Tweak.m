@@ -41,6 +41,15 @@ static BOOL gEverActive = NO;
 static BOOL gRefreshPending = NO;
 // Set while Nig itself changes a property, so the hooks let it through.
 static __thread BOOL tInHook = NO;
+// While a view draws itself: 1 = it sits on a surface Nig made dark, 2 = it does not,
+// 0 = not inside a view's drawLayer:inContext: at all. Core Graphics colour
+// hooks only act in state 1, so glyphs are never lightened over a light surface.
+static __thread int tDrawState = 0;
+// How the app itself resolves dynamic colours: dark when the app follows the
+// system appearance (its dynamic colours are then already dark), light when it
+// is locked to light. Fixed by the window's real trait in NigRefresh.
+static UIUserInterfaceStyle gResolveStyle = UIUserInterfaceStyleLight;
+static UITraitCollection *gResolveTraits = nil;
 
 typedef NS_ENUM(NSInteger, NigRole) {
     NigRoleText,        // text, tint, glyph fills: lighten, keep hue
@@ -146,9 +155,16 @@ static UITraitCollection *NigLightTraits(void) {
 }
 
 // Components of a colour as the light app sees it (dynamic colours resolved light).
+static void NigSetResolveStyle(UIUserInterfaceStyle style) {
+    gResolveStyle = style;
+    gResolveTraits = [UITraitCollection traitCollectionWithUserInterfaceStyle:style];
+}
+
 static BOOL NigGetRGBA(UIColor *color, CGFloat *r, CGFloat *g, CGFloat *b, CGFloat *a) {
     if (!color) return NO;
-    UIColor *resolved = [color resolvedColorWithTraitCollection:NigLightTraits()] ?: color;
+    // Resolved the way the app resolves it: an app that follows the system
+    // style already has dark dynamic colours, which must not be "fixed" again.
+    UIColor *resolved = [color resolvedColorWithTraitCollection:(gResolveTraits ?: NigLightTraits())] ?: color;
     return [resolved getRed:r green:g blue:b alpha:a];
 }
 
@@ -212,7 +228,7 @@ static BOOL NigIsSystemUI(UIView *view) {
     return NO;
 }
 
-static BOOL NigSystemIsDark(void) {
+static BOOL NigSystemIsDark(BOOL allowScreen) {
     BOOL dark = NO;
     // The global domain is readable from an app's sandbox.
     CFPropertyListRef v = CFPreferencesCopyValue(CFSTR("AppleInterfaceStyle"),
@@ -225,7 +241,7 @@ static BOOL NigSystemIsDark(void) {
         }
         CFRelease(v);
     }
-    if (!dark) {
+    if (!dark && allowScreen) {
         dark = ([UIScreen mainScreen].traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
     }
     return dark;
@@ -244,6 +260,8 @@ static NSString *const kOverride = @"override";
 static NSString *const kKeyboard = @"keyboard";
 static NSString *const kPlaceholder = @"placeholder";
 static NSString *const kPlaceholderOut = @"placeholderOut";
+static NSString *const kLayerBg = @"layerBg";
+static NSString *const kShapeFill = @"shapeFill";
 
 static id NigStoreGet(id obj, NSString *key) {
     NSMutableDictionary *d = objc_getAssociatedObject(obj, kNigStoreKey);
@@ -491,6 +509,85 @@ static void NigApplyTextInput(UIView *view, BOOL active) {
     }
 }
 
+#pragma mark - Surfaces drawn by layers
+
+// A colour on a layer, kept the same way as the view ones: what the app set
+// and what Nig put there are both remembered, so a value the app sets later
+// is recognised as its own and a restore puts the app's colour back.
+static void NigSyncLayerColor(CALayer *layer, NSString *key, CGColorRef current, BOOL active,
+                              NigRole role, void (^set)(CGColorRef c)) {
+    NSDictionary *rec = NigStoreGet(layer, key);
+    UIColor *cur = current ? [UIColor colorWithCGColor:current] : nil;
+    UIColor *orig = (rec && cur && [cur isEqual:rec[@"out"]]) ? rec[@"orig"] : cur;
+    if (!orig) return;
+    UIColor *want = active ? NigTransformColor(orig, role) : nil;
+    if (want) {
+        if (!(cur && [cur isEqual:want])) set(want.CGColor);
+        NigStoreSet(layer, key, @{@"orig": orig, @"out": want});
+    } else {
+        if (rec && ![orig isEqual:cur]) set(orig.CGColor);
+        NigStoreRemove(layer, key);
+    }
+}
+
+static void NigSyncGradient(CAGradientLayer *layer, BOOL active) {
+    NSDictionary *rec = NigStoreGet(layer, @"grad");
+    NSArray *cur = layer.colors;
+    NSArray *orig = (rec && cur && [cur isEqualToArray:rec[@"out"]]) ? rec[@"orig"] : cur;
+    if (orig.count == 0) return;
+    NSMutableArray *out = nil;
+    if (active) {
+        out = [NSMutableArray arrayWithCapacity:orig.count];
+        BOOL changed = NO;
+        for (id item in orig) {
+            if (CFGetTypeID((__bridge CFTypeRef)item) != CGColorGetTypeID()) { [out addObject:item]; continue; }
+            CGColorRef mapped = NigCopyTransformedCGColor((__bridge CGColorRef)item, NigRoleBackground);
+            if (mapped) { [out addObject:(__bridge id)mapped]; CGColorRelease(mapped); changed = YES; }
+            else [out addObject:item];
+        }
+        if (!changed) out = nil;
+    }
+    if (out) {
+        if (![cur isEqualToArray:out]) layer.colors = out;
+        NigStoreSet(layer, @"grad", @{@"orig": orig, @"out": out});
+    } else {
+        if (rec && ![orig isEqualToArray:cur]) layer.colors = orig;
+        NigStoreRemove(layer, @"grad");
+    }
+}
+
+static BOOL NigLayerIsHandled(CALayer *layer) {
+    // Plain colour layers only: not blur backdrops, video, Metal or emitters.
+    Class c = [layer class];
+    return c == [CALayer class] || c == [CAShapeLayer class] || c == [CAGradientLayer class];
+}
+
+// `own` is the view's own layer (only its backgroundColor is touched, and only
+// when the view itself has none); the others are the big plain sublayers that
+// act as a surface behind the content (cards, headers, gradients).
+static void NigApplyLayerColors(CALayer *layer, BOOL active, BOOL own) {
+    if (!NigLayerIsHandled(layer) || layer.contents) return;
+    NigSyncLayerColor(layer, kLayerBg, layer.backgroundColor, active, NigRoleBackground,
+                      ^(CGColorRef c) { layer.backgroundColor = c; });
+    if (own) return;
+    if ([layer isKindOfClass:[CAShapeLayer class]]) {
+        CAShapeLayer *shape = (CAShapeLayer *)layer;
+        NigSyncLayerColor(shape, kShapeFill, shape.fillColor, active, NigRoleBackground,
+                          ^(CGColorRef c) { shape.fillColor = c; });
+    } else if ([layer isKindOfClass:[CAGradientLayer class]]) {
+        NigSyncGradient((CAGradientLayer *)layer, active);
+    }
+}
+
+static void NigApplySurfaceSublayers(CALayer *parent, BOOL active, NSInteger depth) {
+    if (depth > 4) return;
+    for (CALayer *s in [parent.sublayers copy]) {
+        if (!NigIsPlainSublayer(s, parent)) continue;  // subview layers and small shapes stay
+        NigApplyLayerColors(s, active, NO);
+        NigApplySurfaceSublayers(s, active, depth + 1);
+    }
+}
+
 // Bars and blur views follow the dark style natively, which also darkens
 // whatever is drawn by the system in them.
 static BOOL NigWantsDarkOverride(UIView *view) {
@@ -512,13 +609,25 @@ static void NigApplySelf(UIView *view) {
                  ^(UIColor *c) { view.backgroundColor = c; });
 
     if (NigWantsDarkOverride(view)) {
-        if (active && view.overrideUserInterfaceStyle != UIUserInterfaceStyleDark) {
+        // An app that already follows the system style has dark bars.
+        BOOL wantOverride = active && gResolveStyle != UIUserInterfaceStyleDark;
+        if (wantOverride && view.overrideUserInterfaceStyle != UIUserInterfaceStyleDark) {
             NigStoreSet(view, kOverride, @(view.overrideUserInterfaceStyle));
             view.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
-        } else if (!active && NigStoreGet(view, kOverride)) {
+        } else if (!wantOverride && NigStoreGet(view, kOverride)) {
             view.overrideUserInterfaceStyle = (UIUserInterfaceStyle)[NigStoreGet(view, kOverride) integerValue];
             NigStoreRemove(view, kOverride);
         }
+    }
+
+    // Surfaces that are layers rather than the view's backgroundColor, so
+    // that the backdrop check below sees them dark before any text follows.
+    if (!view.backgroundColor && ![view isKindOfClass:[UIVisualEffectView class]] &&
+        ![view isKindOfClass:[UIImageView class]]) {
+        NigApplyLayerColors(view.layer, active, YES);
+    }
+    if (![view isKindOfClass:[UIVisualEffectView class]] && ![view isKindOfClass:[UIImageView class]]) {
+        NigApplySurfaceSublayers(view.layer, active, 0);
     }
 
     if ([view isKindOfClass:[UILabel class]]) {
@@ -575,11 +684,13 @@ static void NigRefresh(void) {
     UIWindow *probe = NigProbeWindow(windows);
     if (!probe) return;  // no window yet: a later notification retries
 
-    BOOL system = NigSystemIsDark();
+    BOOL system = NigSystemIsDark(YES);
     // An app that renders dark by itself (system style or its own toggle)
     // needs no help; the window's trait says what the app really renders.
     BOOL appDark = (probe.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
     BOOL active = system && !appDark;
+    // Dynamic colours are read the way the app itself resolves them.
+    NigSetResolveStyle(appDark ? UIUserInterfaceStyleDark : UIUserInterfaceStyleLight);
 
     if (active != gDarkModeActive) {
         os_log(TweakLog(), "ApelinState active=%d system=%d appDark=%d %{public}s",
@@ -611,6 +722,7 @@ static void (*OrigDidMoveToWindow)(UIView *, SEL);
 static void (*OrigLabelSetTextColor)(UILabel *, SEL, UIColor *);
 static void (*OrigLabelSetAttributedText)(UILabel *, SEL, NSAttributedString *);
 static void (*OrigLayerSetBackgroundColor)(CALayer *, SEL, CGColorRef);
+static void (*OrigDrawLayerInContext)(UIView *, SEL, CALayer *, CGContextRef);
 static void (*OrigSetFillColor)(CGContextRef, CGColorRef);
 static void (*OrigSetStrokeColor)(CGContextRef, CGColorRef);
 
@@ -699,8 +811,11 @@ static void HookedLabelSetAttributedText(UILabel *self, SEL _cmd, NSAttributedSt
 
 #pragma mark - Hooks: CALayer and CoreGraphics
 
+// A background a layer gets from the app (or UIKit) while dark mode is on.
+// The app's colour is remembered like NigSyncLayerColor does, so it can be restored.
 static void HookedLayerSetBackgroundColor(CALayer *self, SEL _cmd, CGColorRef color) {
-    if (tInHook || !gDarkModeActive || !color) {
+    if (tInHook || !gDarkModeActive || !color || ![NSThread isMainThread] ||
+        !NigLayerIsHandled(self) || self.contents) {
         OrigLayerSetBackgroundColor(self, _cmd, color);
         return;
     }
@@ -709,15 +824,37 @@ static void HookedLayerSetBackgroundColor(CALayer *self, SEL _cmd, CGColorRef co
         OrigLayerSetBackgroundColor(self, _cmd, color);
         return;
     }
-    CGColorRef mapped = NigCopyTransformedCGColor(color, NigRoleBackground);
-    OrigLayerSetBackgroundColor(self, _cmd, mapped ?: color);
-    if (mapped) CGColorRelease(mapped);
+    UIColor *orig = [UIColor colorWithCGColor:color];
+    UIColor *want = NigTransformColor(orig, NigRoleBackground);
+    if (!want) {
+        NigStoreRemove(self, kLayerBg);
+        OrigLayerSetBackgroundColor(self, _cmd, color);
+        return;
+    }
+    NigStoreSet(self, kLayerBg, @{@"orig": orig, @"out": want});
+    tInHook = YES;
+    OrigLayerSetBackgroundColor(self, _cmd, want.CGColor);
+    tInHook = NO;
+}
+
+// Sets tDrawState for the duration of a view's own drawing: Core Graphics
+// colours are only lightened while the view draws onto a surface Nig made dark.
+static void HookedDrawLayerInContext(UIView *self, SEL _cmd, CALayer *layer, CGContextRef ctx) {
+    int previous = tDrawState;
+    if (gDarkModeActive && !tInHook && [NSThread isMainThread]) {
+        tDrawState = (!NigIsSystemUI(self) && NigBackdropOf(self) == NigBackdropDark) ? 1 : 2;
+    } else {
+        tDrawState = 2;
+    }
+    OrigDrawLayerInContext(self, _cmd, layer, ctx);
+    tDrawState = previous;
 }
 
 // Dark fills and strokes (text glyphs, icons, shapes) get their lighter
-// counterpart. Light colours are untouched.
+// counterpart, but only while a view draws onto a dark surface (tDrawState 1).
+// Light colours are untouched.
 static void HookedSetFillColor(CGContextRef ctx, CGColorRef color) {
-    if (gDarkModeActive && color && !tInHook) {
+    if (gDarkModeActive && color && !tInHook && tDrawState == 1) {
         CGColorRef mapped = NigCopyTransformedCGColor(color, NigRoleText);
         if (mapped) {
             OrigSetFillColor(ctx, mapped);
@@ -729,7 +866,7 @@ static void HookedSetFillColor(CGContextRef ctx, CGColorRef color) {
 }
 
 static void HookedSetStrokeColor(CGContextRef ctx, CGColorRef color) {
-    if (gDarkModeActive && color && !tInHook) {
+    if (gDarkModeActive && color && !tInHook && tDrawState == 1) {
         CGColorRef mapped = NigCopyTransformedCGColor(color, NigRoleText);
         if (mapped) {
             OrigSetStrokeColor(ctx, mapped);
@@ -785,6 +922,8 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                     (IMP)HookedLabelSetAttributedText, (IMP *)&OrigLabelSetAttributedText);
     MSHookMessageEx([CALayer class], @selector(setBackgroundColor:),
                     (IMP)HookedLayerSetBackgroundColor, (IMP *)&OrigLayerSetBackgroundColor);
+    MSHookMessageEx([UIView class], @selector(drawLayer:inContext:),
+                    (IMP)HookedDrawLayerInContext, (IMP *)&OrigDrawLayerInContext);
     MSHookFunction((void *)CGContextSetFillColorWithColor,
                    (void *)HookedSetFillColor, (void **)&OrigSetFillColor);
     MSHookFunction((void *)CGContextSetStrokeColorWithColor,
