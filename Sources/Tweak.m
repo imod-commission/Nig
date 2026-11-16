@@ -395,8 +395,7 @@ static BOOL NigSampleBehind(UIView *view, CGFloat *mean, CGFloat *spread) {
 
     NSDictionary *cached = NigStoreGet(view, @"behind");
     if (cached && [cached[@"epoch"] unsignedIntegerValue] == gSampleEpoch &&
-        CGRectEqualToRect(CGRectIntegral(r), CGRectIntegral(CGRectFromString(cached[@"rect"]))) &&
-        CACurrentMediaTime() - [cached[@"time"] doubleValue] < 0.5) {
+        CGRectEqualToRect(CGRectIntegral(r), CGRectIntegral(CGRectFromString(cached[@"rect"])))) {
         if (![cached[@"ok"] boolValue]) return NO;
         *mean = [cached[@"mean"] doubleValue];
         *spread = [cached[@"spread"] doubleValue];
@@ -451,21 +450,21 @@ static BOOL NigSampleBehind(UIView *view, CGFloat *mean, CGFloat *spread) {
 // For text and glyphs: the backdrop as it looks, falling back to the model
 // (NigBackdropOf) when it cannot be read.
 static NigBackdrop NigTextBackdrop(UIView *view) {
+    // The model is cheap and gives the same answer every time. Pixels are only
+    // read when it cannot tell (a photo, a gradient or a banner behind).
+    NigBackdrop model = NigBackdropOf(view);
+    if (model != NigBackdropMedia) return model;
     CGSize size = view.bounds.size;
     BOOL small = size.height <= 120 && size.width * size.height <= 60000;  // a big view has no single backdrop
     if (small && view.window && [NSThread isMainThread]) {
-        for (UIView *v = view; v; v = v.superview) {
-            if ([v isKindOfClass:[UIVisualEffectView class]]) return NigBackdropDark;  // bars are forced dark
-        }
         CGFloat mean, spread;
         if (NigSampleBehind(view, &mean, &spread)) {
             if (spread > 0.45) return NigBackdropMedia;
             if (mean < 0.45) return NigBackdropDark;
             if (mean > 0.55) return NigBackdropLight;
-            return NigBackdropMedia;
         }
     }
-    return NigBackdropOf(view);
+    return NigBackdropMedia;
 }
 
 #pragma mark - Decisions
@@ -1082,12 +1081,47 @@ static void HookedSetTintColor(UIView *self, SEL _cmd, UIColor *color) {
     tInHook = NO;
 }
 
+// A page change builds its views before their backgrounds and images are in
+// place, so a decision taken the moment a view arrives can be premature. The
+// arrived views are remembered and judged once more when things have been
+// quiet for a moment: one pass, no timer, nothing while the app is idle.
+static NSHashTable<UIView *> *gArrived;
+static NSUInteger gSettleGeneration = 0;
+
+static void NigSettleArrived(void) {
+    NSArray<UIView *> *views = gArrived.allObjects;
+    [gArrived removeAllObjects];
+    if (!gDarkModeActive || views.count == 0) return;
+    NSHashTable *set = [NSHashTable weakObjectsHashTable];
+    for (UIView *v in views) [set addObject:v];
+    gSampleEpoch++;
+    for (UIView *v in views) {
+        if (!v.window) continue;
+        BOOL covered = NO;  // an ancestor is also arrived: its pass reaches this view
+        for (UIView *a = v.superview; a; a = a.superview) {
+            if ([set containsObject:a]) { covered = YES; break; }
+        }
+        if (!covered) NigApplyTree(v, 0);
+    }
+}
+
+static void NigScheduleSettle(UIView *view) {
+    if (!gArrived) gArrived = [NSHashTable weakObjectsHashTable];
+    [gArrived addObject:view];
+    NSUInteger generation = ++gSettleGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (generation == gSettleGeneration) NigSettleArrived();
+    });
+}
+
 // Only this view: its subviews get their own didMoveToWindow. Walking the
 // whole subtree here was quadratic.
 static void HookedDidMoveToWindow(UIView *self, SEL _cmd) {
     OrigDidMoveToWindow(self, _cmd);
     if (self.window && gDarkModeActive && [NSThread isMainThread] && !tInHook) {
         NigApplySelf(self);
+        NigScheduleSettle(self);
     }
 }
 
