@@ -39,6 +39,8 @@ static os_log_t TweakLog(void) {
 static BOOL gDarkModeActive = NO;
 static BOOL gEverActive = NO;
 static BOOL gRefreshPending = NO;
+static BOOL gSystemDarkSeen = NO;
+static CFAbsoluteTime gLastRefreshTime = 0;
 // Set while Nig itself changes a property, so the hooks let it through.
 static __thread BOOL tInHook = NO;
 // While a view draws itself: 1 = it sits on a surface Nig made dark, 2 = it does not,
@@ -241,6 +243,12 @@ static BOOL NigSystemIsDark(BOOL allowScreen) {
         }
         CFRelease(v);
     }
+    if (!dark) {
+        // An app locked to light mode still sees the system's own setting here,
+        // which the screen's and the windows' traits no longer show.
+        id style = [[NSUserDefaults standardUserDefaults] objectForKey:@"AppleInterfaceStyle"];
+        if ([style isKindOfClass:[NSString class]]) dark = [style isEqualToString:@"Dark"];
+    }
     if (!dark && allowScreen) {
         dark = ([UIScreen mainScreen].traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
     }
@@ -295,6 +303,13 @@ static BOOL NigIsPlainSublayer(CALayer *s, CALayer *parent) {
            CGRectGetHeight(s.frame) >= 0.5 * CGRectGetHeight(pb);
 }
 
+// Layer contents that are an image the app set (a photo, a banner). A view
+// that draws itself has a backing store there instead, which says nothing
+// about what the view looks like: its fills are handled while it draws.
+static BOOL NigIsCGImage(id contents) {
+    return contents && CFGetTypeID((__bridge CFTypeRef)contents) == CGImageGetTypeID();
+}
+
 // Classifies the first thing behind `view` that has a look of its own.
 static NigBackdrop NigBackdropOf(UIView *view) {
     NSInteger depth = 0;
@@ -305,14 +320,14 @@ static NigBackdrop NigBackdropOf(UIView *view) {
 
         if (v != view) {
             if ([v isKindOfClass:[UIImageView class]] && ((UIImageView *)v).image) return NigBackdropMedia;
-            if (layer.contents || [layer isKindOfClass:[CAGradientLayer class]]) return NigBackdropMedia;
+            if (NigIsCGImage(layer.contents) || [layer isKindOfClass:[CAGradientLayer class]]) return NigBackdropMedia;
 
             NSArray<CALayer *> *subs = layer.sublayers;
             NSUInteger n = MIN(subs.count, (NSUInteger)8);
             for (NSUInteger i = 0; i < n; i++) {
                 CALayer *s = subs[i];
                 if (!NigIsPlainSublayer(s, layer)) continue;
-                if (s.contents || [s isKindOfClass:[CAGradientLayer class]]) return NigBackdropMedia;
+                if (NigIsCGImage(s.contents) || [s isKindOfClass:[CAGradientLayer class]]) return NigBackdropMedia;
                 CGColorRef fill = [s isKindOfClass:[CAShapeLayer class]] ? ((CAShapeLayer *)s).fillColor : s.backgroundColor;
                 if (fill && CGColorGetAlpha(fill) >= 0.6) {
                     UIColor *c = [UIColor colorWithCGColor:fill];
@@ -509,6 +524,110 @@ static void NigApplyTextInput(UIView *view, BOOL active) {
     }
 }
 
+#pragma mark - Icons (small one-colour bitmaps)
+
+static NSString *const kIcon = @"icon";
+static const void *kNigIconTintKey = &kNigIconTintKey;
+static const void *kNigIconImageKey = &kNigIconImageKey;
+static int gDiagIcons = 0;
+
+// A small, mostly transparent, one-colour, dark bitmap (a glyph the app
+// ships as a PNG) cannot follow a tint, so it is recoloured as a whole.
+// Returns its lighter counterpart, or nil for anything else (photos, icons
+// with several colours, light icons, template images). Cached per image.
+static UIColor *NigIconTint(UIImage *image) {
+    id cached = objc_getAssociatedObject(image, kNigIconTintKey);
+    if (cached) return [cached isKindOfClass:[UIColor class]] ? cached : nil;
+
+    UIColor *result = nil;
+    CGImageRef cg = image.CGImage;
+    CGSize sz = image.size;
+    BOOL eligible = cg && sz.width >= 8 && sz.height >= 8 && sz.width <= 64 && sz.height <= 64 &&
+                    image.renderingMode != UIImageRenderingModeAlwaysTemplate &&
+                    !image.isSymbolImage && image.images == nil;
+    if (eligible) {
+        enum { N = 16 };
+        uint8_t px[N * N * 4];
+        memset(px, 0, sizeof(px));
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        CGContextRef bc = CGBitmapContextCreate(px, N, N, 8, N * 4, cs,
+                                                kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(cs);
+        if (bc) {
+            CGContextDrawImage(bc, CGRectMake(0, 0, N, N), cg);
+            CGContextRelease(bc);
+            double sumA = 0, sr = 0, sg = 0, sb = 0;
+            int opaque = 0, visible = 0;
+            for (int i = 0; i < N * N; i++) {
+                double a = px[i * 4 + 3] / 255.0;
+                if (a > 0.9) opaque++;
+                if (a > 0.3) visible++;
+                sumA += a;
+                sr += px[i * 4] / 255.0;
+                sg += px[i * 4 + 1] / 255.0;
+                sb += px[i * 4 + 2] / 255.0;
+            }
+            if (visible >= 6 && sumA > 0 && opaque < (int)(0.85 * N * N)) {
+                double ar = sr / sumA, ag = sg / sumA, ab = sb / sumA;
+                int mixed = 0;
+                for (int i = 0; i < N * N; i++) {
+                    double a = px[i * 4 + 3] / 255.0;
+                    if (a <= 0.3) continue;
+                    double dr = px[i * 4] / 255.0 / a - ar;
+                    double dg = px[i * 4 + 1] / 255.0 / a - ag;
+                    double db = px[i * 4 + 2] / 255.0 / a - ab;
+                    if (MAX(MAX(fabs(dr), fabs(dg)), fabs(db)) > 0.22) mixed++;
+                }
+                if (mixed * 10 <= visible && NigLuma(ar, ag, ab) < 0.4) {
+                    result = NigTransformColor([UIColor colorWithRed:ar green:ag blue:ab alpha:1], NigRoleText);
+                }
+            }
+        }
+    }
+    objc_setAssociatedObject(image, kNigIconTintKey, result ?: (id)[NSNull null], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return result;
+}
+
+static UIImage *NigRecolored(UIImage *image, UIColor *color) {
+    UIImage *cached = objc_getAssociatedObject(image, kNigIconImageKey);
+    if (cached) return cached;
+    int previous = tDrawState;
+    tDrawState = 0;
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
+    format.scale = image.scale;
+    format.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:image.size format:format];
+    UIImage *out = [renderer imageWithActions:^(UIGraphicsImageRendererContext *rc) {
+        CGRect rect = CGRectMake(0, 0, image.size.width, image.size.height);
+        [image drawInRect:rect];
+        CGContextSetBlendMode(rc.CGContext, kCGBlendModeSourceIn);
+        CGContextSetFillColorWithColor(rc.CGContext, color.CGColor);
+        CGContextFillRect(rc.CGContext, rect);
+    }];
+    tDrawState = previous;
+    out = [out imageWithAlignmentRectInsets:image.alignmentRectInsets];
+    objc_setAssociatedObject(image, kNigIconImageKey, out, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return out;
+}
+
+static void NigApplyImageView(UIImageView *iv, BOOL active) {
+    NSDictionary *rec = NigStoreGet(iv, kIcon);
+    UIImage *cur = iv.image;
+    UIImage *orig = (rec && cur == rec[@"out"]) ? rec[@"orig"] : cur;
+    UIImage *want = nil;
+    if (active && orig && NigBackdropOf(iv) == NigBackdropDark) {
+        UIColor *tint = NigIconTint(orig);
+        if (tint) want = NigRecolored(orig, tint);
+    }
+    if (want) {
+        if (cur != want) { iv.image = want; gDiagIcons++; }
+        NigStoreSet(iv, kIcon, @{@"orig": orig, @"out": want});
+    } else {
+        if (rec && cur == rec[@"out"]) iv.image = orig;
+        NigStoreRemove(iv, kIcon);
+    }
+}
+
 #pragma mark - Surfaces drawn by layers
 
 // A colour on a layer, kept the same way as the view ones: what the app set
@@ -553,6 +672,20 @@ static void NigSyncGradient(CAGradientLayer *layer, BOOL active) {
     } else {
         if (rec && ![orig isEqualToArray:cur]) layer.colors = orig;
         NigStoreRemove(layer, @"grad");
+    }
+}
+
+// Text a view draws with CATextLayer sublayers (some apps never use UILabel).
+static void NigApplyTextLayers(UIView *view, BOOL active) {
+    NSArray<CALayer *> *subs = view.layer.sublayers;
+    if (subs.count == 0) return;
+    BOOL dark = NO, known = NO;
+    for (CALayer *s in [subs copy]) {
+        if (![s isKindOfClass:[CATextLayer class]]) continue;
+        if (!known) { dark = active && NigBackdropOf(view) == NigBackdropDark; known = YES; }
+        CATextLayer *t = (CATextLayer *)s;
+        NigSyncLayerColor(t, @"textLayerFg", t.foregroundColor, dark, NigRoleText,
+                          ^(CGColorRef c) { t.foregroundColor = c; });
     }
 }
 
@@ -636,7 +769,10 @@ static void NigApplySelf(UIView *view) {
         NigApplyButton((UIButton *)view, active);
     } else if ([view isKindOfClass:[UITextField class]] || [view isKindOfClass:[UITextView class]]) {
         NigApplyTextInput(view, active);
+    } else if ([view isKindOfClass:[UIImageView class]]) {
+        NigApplyImageView((UIImageView *)view, active);
     }
+    NigApplyTextLayers(view, active);
 
     // The window's tint is inherited by every view below it; touching each
     // subview's tint would break that inheritance.
@@ -720,10 +856,15 @@ static void NigRefresh(void) {
     BOOL appDark = traitDark && NigAppRendersDark(probe);
     BOOL active = system && !appDark;
 
-    if (active != gDarkModeActive) {
+    static int lastSig = -1;
+    int sig = (system ? 1 : 0) | (traitDark ? 2 : 0) | (appDark ? 4 : 0);
+    if (sig != lastSig) {
+        lastSig = sig;
         os_log(TweakLog(), "ApelinState active=%d system=%d traitDark=%d appDark=%d %{public}s",
                active, system, traitDark, appDark, getprogname());
     }
+    gSystemDarkSeen = system;
+    gLastRefreshTime = CFAbsoluteTimeGetCurrent();
     gDarkModeActive = active;
     if (active) gEverActive = YES;
     if (!gEverActive) return;  // nothing was ever changed, nothing to restore
@@ -797,6 +938,24 @@ static void HookedDidMoveToWindow(UIView *self, SEL _cmd) {
     OrigDidMoveToWindow(self, _cmd);
     if (self.window && gDarkModeActive && [NSThread isMainThread] && !tInHook) {
         NigApplySelf(self);
+    } else if (self.window && !gDarkModeActive && gSystemDarkSeen && [NSThread isMainThread] && !tInHook &&
+               CFAbsoluteTimeGetCurrent() - gLastRefreshTime > 1.0) {
+        // Not active yet (a splash screen or a dark first page was judged): the
+        // app may have moved on, so judge again as its UI changes.
+        NigRequestRefresh();
+    }
+}
+
+#pragma mark - Hooks: UIImageView
+
+static void (*OrigImageSetImage)(UIImageView *, SEL, UIImage *);
+
+static void HookedImageSetImage(UIImageView *self, SEL _cmd, UIImage *image) {
+    OrigImageSetImage(self, _cmd, image);
+    if (NigShouldHandle(self) && self.window) {
+        tInHook = YES;
+        NigApplyImageView(self, YES);
+        tInHook = NO;
     }
 }
 
@@ -944,6 +1103,8 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                     (IMP)HookedSetTintColor, (IMP *)&OrigSetTintColor);
     MSHookMessageEx([UIView class], @selector(didMoveToWindow),
                     (IMP)HookedDidMoveToWindow, (IMP *)&OrigDidMoveToWindow);
+    MSHookMessageEx([UIImageView class], @selector(setImage:),
+                    (IMP)HookedImageSetImage, (IMP *)&OrigImageSetImage);
     MSHookMessageEx([UILabel class], @selector(setTextColor:),
                     (IMP)HookedLabelSetTextColor, (IMP *)&OrigLabelSetTextColor);
     MSHookMessageEx([UILabel class], @selector(setAttributedText:),
