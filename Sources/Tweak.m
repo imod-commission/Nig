@@ -1009,7 +1009,8 @@ static void NigRequestRefresh(void) {
 
 // `com.imodcommission.nig.dump` makes the app in front write its whole
 // view and layer tree, with the colours Nig saw, changed and decided, to
-// <app tmp>/nig-dump.txt. It runs only on that signal: nothing is polled.
+// <app tmp>/nig-dump-<time>.txt. It runs only on that signal or when the
+// user takes a screenshot: nothing is polled.
 static const char *const kDumpNotification = "com.imodcommission.nig.dump";
 
 static NSString *NigHex(UIColor *c) {
@@ -1216,11 +1217,11 @@ static void NigDumpControllers(NSMutableString *out, UIViewController *vc, int d
     }
 }
 
-static void NigDump(void) {
+static void NigDump(NSString *reason) {
     NSMutableString *out = [NSMutableString string];
     NSMutableArray<UIWindow *> *windows = [NSMutableArray array];
     NigProbeWindow(windows);
-    [out appendFormat:@"Nig dump %s build %s pid %d bundle %@\n", getprogname(), APELIN_BUILD_ID, getpid(),
+    [out appendFormat:@"Nig dump (%@) %s build %s pid %d bundle %@\n", reason, getprogname(), APELIN_BUILD_ID, getpid(),
                       [NSBundle mainBundle].bundleIdentifier];
     [out appendFormat:@"active=%d everActive=%d resolve=%ld published=%d windows=%lu\n", gDarkModeActive,
                       gEverActive, (long)gResolveStyle, NigPublishedStyle(), (unsigned long)windows.count];
@@ -1235,7 +1236,10 @@ static void NigDump(void) {
         NigDumpView(out, w, 0, &lines);
     }
     if (lines > 12000) [out appendString:@"\n(truncated at 12000 lines)\n"];
-    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"nig-dump.txt"];
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.dateFormat = @"yyyyMMdd-HHmmss";
+    NSString *name = [NSString stringWithFormat:@"nig-dump-%@.txt", [fmt stringFromDate:[NSDate date]]];
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
     NSError *error = nil;
     BOOL ok = [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&error];
     os_log(TweakLog(), "ApelinDump ok=%d lines=%lu bytes=%lu %{public}s %{public}@", ok, (unsigned long)lines,
@@ -1570,8 +1574,15 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     });
     int dumpToken = NOTIFY_TOKEN_INVALID;
     notify_register_dispatch(kDumpNotification, &dumpToken, dispatch_get_main_queue(), ^(int t __unused) {
-        if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) NigDump();
+        if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) NigDump(@"notify");
     });
+    // A screenshot of a page that looks wrong also records that page's tree.
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationUserDidTakeScreenshotNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note __unused) {
+        NigDump(@"screenshot");
+    }];
     NigObserve(UIApplicationDidFinishLaunchingNotification, 0.6);
     NigObserve(UIApplicationWillEnterForegroundNotification, 0.0);
     NigObserve(UIApplicationDidBecomeActiveNotification, 0.6);
