@@ -298,6 +298,7 @@ static BOOL NigSystemIsDark(BOOL allowScreen) {
 static const void *kNigStoreKey = &kNigStoreKey;
 static NSString *const kBg = @"bg";
 static NSString *const kText = @"text";
+static NSString *const kHiText = @"hiText";
 static NSString *const kAttr = @"attr";
 static NSString *const kAttrOut = @"attrOut";
 static NSString *const kTint = @"tint";
@@ -348,25 +349,103 @@ static BOOL NigIsCGImage(id contents) {
     return contents && CFGetTypeID((__bridge CFTypeRef)contents) == CGImageGetTypeID();
 }
 
+// What a layer's image looks like at `p` (in the layer's coordinates).
+// Frameworks such as Taobao's MUS give every box a bitmap of its own,
+// usually transparent but for a border or a corner: such a bitmap is no
+// surface where the text is, and the search goes on (answers NO). Where it
+// is opaque, its colour there decides. Images that cannot be mapped
+// simply (gravity other than resize, huge ones) stay media.
+// Answers are cached on the layer per image and spot, so a bitmap is read
+// once, not on every query.
+static NSString *const kImageLook = @"imageLook";  // @{ img, spots }
+static BOOL NigImageLookAt(CALayer *layer, CGPoint p, NigBackdrop *out) {
+    CGImageRef image = (__bridge CGImageRef)layer.contents;
+    size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+    CGRect b = layer.bounds;
+    if (w == 0 || h == 0 || w * h > 4000000 || CGRectIsEmpty(b) ||
+        ![layer.contentsGravity isEqualToString:kCAGravityResize]) {
+        *out = NigBackdropMedia;
+        return YES;
+    }
+    CGFloat u = MIN(MAX((p.x - b.origin.x) / b.size.width, 0), 1);
+    CGFloat v = MIN(MAX((p.y - b.origin.y) / b.size.height, 0), 1);
+    CGRect cc = layer.contentsCenter;
+    if (!CGRectEqualToRect(cc, CGRectMake(0, 0, 1, 1))) {
+        // A stretchable image (a bubble, a card): its middle is what fills.
+        u = CGRectGetMidX(cc);
+        v = CGRectGetMidY(cc);
+    }
+    CGRect cr = layer.contentsRect;
+    u = cr.origin.x + u * cr.size.width;
+    v = cr.origin.y + v * cr.size.height;
+    size_t x = MIN((size_t)(u * w), w - 1), y = MIN((size_t)(v * h), h - 1);
+
+    BOOL main = [NSThread isMainThread];
+    NSNumber *spot = @((x / 4) << 20 | (y / 4));
+    NSMutableDictionary *spots = nil;
+    if (main) {
+        NSDictionary *cache = NigStoreGet(layer, kImageLook);
+        if (cache && cache[@"img"] == (__bridge id)image) {
+            spots = cache[@"spots"];
+            NSNumber *hit = spots[spot];
+            if (hit) {
+                if (hit.integerValue < 0) return NO;
+                *out = (NigBackdrop)hit.integerValue;
+                return YES;
+            }
+        } else {
+            spots = [NSMutableDictionary dictionary];
+            NigStoreSet(layer, kImageLook, @{ @"img": (__bridge id)image, @"spots": spots });
+        }
+    }
+
+    uint8_t px[4] = {0, 0, 0, 0};
+    CGImageRef crop = CGImageCreateWithImageInRect(image, CGRectMake(x, y, 1, 1));
+    if (crop) {
+        CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(px, 1, 1, 8, 4, space,
+                                                 kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(space);
+        if (ctx) {
+            CGContextSetBlendMode(ctx, kCGBlendModeCopy);
+            CGContextDrawImage(ctx, CGRectMake(0, 0, 1, 1), crop);
+            CGContextRelease(ctx);
+        }
+        CGImageRelease(crop);
+    }
+    NSInteger result;
+    if (px[3] < 153) {
+        result = -1;  // see-through here
+    } else {
+        CGFloat a = px[3] / 255.0;
+        CGFloat r = px[0] / 255.0 / a, g = px[1] / 255.0 / a, bl = px[2] / 255.0 / a;
+        result = NigLuma(r, g, bl) > 0.55 ? NigBackdropLight : NigBackdropDark;
+    }
+    if (spots && spots.count < 64) spots[spot] = @(result);
+    if (result < 0) return NO;
+    *out = (NigBackdrop)result;
+    return YES;
+}
+
 // What a view painted below another one (an earlier sibling) looks like.
 // Answers NO when it has no look of its own there, so the search goes on.
-static BOOL NigSiblingLook(UIView *s, NigBackdrop *out) {
+static BOOL NigSiblingLook(UIView *s, CGPoint pp, NigBackdrop *out) {
     if (s.hidden || s.alpha < 0.05) return NO;
     if ([s isKindOfClass:[UIVisualEffectView class]]) { *out = NigBackdropDark; return YES; }
     if ([s isKindOfClass:[UIImageView class]] && ((UIImageView *)s).image) { *out = NigBackdropMedia; return YES; }
     CALayer *layer = s.layer;
-    if (NigIsCGImage(layer.contents) || [layer isKindOfClass:[CAGradientLayer class]]) {
-        *out = NigBackdropMedia;
-        return YES;
-    }
+    CGPoint sp = [s convertPoint:pp fromView:s.superview];
+    if ([layer isKindOfClass:[CAGradientLayer class]]) { *out = NigBackdropMedia; return YES; }
+    if (NigIsCGImage(layer.contents) && NigImageLookAt(layer, sp, out)) return YES;
     NSArray<CALayer *> *subs = layer.sublayers;
     NSUInteger n = MIN(subs.count, (NSUInteger)4);
     for (NSUInteger i = 0; i < n; i++) {
         CALayer *sub = subs[i];
         if (!NigIsPlainSublayer(sub, layer)) continue;
-        if (NigIsCGImage(sub.contents) || [sub isKindOfClass:[CAGradientLayer class]]) {
-            *out = NigBackdropMedia;
-            return YES;
+        if ([sub isKindOfClass:[CAGradientLayer class]]) { *out = NigBackdropMedia; return YES; }
+        if (NigIsCGImage(sub.contents)) {
+            CGPoint subp = [layer convertPoint:sp toLayer:sub];
+            if (CGRectContainsPoint(sub.bounds, subp) && NigImageLookAt(sub, subp, out)) return YES;
         }
     }
     CGFloat r, g, b, a;
@@ -407,9 +486,16 @@ static NigBackdrop NigBackdropExplainInner(UIView *view, NSString **why) {
                 NIG_WHY(@"%@ %p image", NSStringFromClass([v class]), v);
                 return NigBackdropMedia;
             }
-            if (NigIsCGImage(layer.contents) || [layer isKindOfClass:[CAGradientLayer class]]) {
-                NIG_WHY(@"%@ %p contents/gradient", NSStringFromClass([v class]), v);
+            if ([layer isKindOfClass:[CAGradientLayer class]]) {
+                NIG_WHY(@"%@ %p gradient", NSStringFromClass([v class]), v);
                 return NigBackdropMedia;
+            }
+            if (NigIsCGImage(layer.contents)) {
+                NigBackdrop look;
+                if (NigImageLookAt(layer, p, &look)) {
+                    NIG_WHY(@"%@ %p contents", NSStringFromClass([v class]), v);
+                    return look;
+                }
             }
 
             NSArray<CALayer *> *subs = layer.sublayers;
@@ -417,9 +503,18 @@ static NigBackdrop NigBackdropExplainInner(UIView *view, NSString **why) {
             for (NSUInteger i = 0; i < n; i++) {
                 CALayer *s = subs[i];
                 if (!NigIsPlainSublayer(s, layer)) continue;
-                if (NigIsCGImage(s.contents) || [s isKindOfClass:[CAGradientLayer class]]) {
+                if ([s isKindOfClass:[CAGradientLayer class]]) {
                     NIG_WHY(@"%@ %p sublayer %@ media", NSStringFromClass([v class]), v, NSStringFromClass([s class]));
                     return NigBackdropMedia;
+                }
+                if (NigIsCGImage(s.contents)) {
+                    CGPoint sp = [layer convertPoint:p toLayer:s];
+                    NigBackdrop look;
+                    if (CGRectContainsPoint(s.bounds, sp) && NigImageLookAt(s, sp, &look)) {
+                        NIG_WHY(@"%@ %p sublayer %@ image", NSStringFromClass([v class]), v, NSStringFromClass([s class]));
+                        return look;
+                    }
+                    continue;
                 }
                 CGColorRef fill = [s isKindOfClass:[CAShapeLayer class]] ? ((CAShapeLayer *)s).fillColor : s.backgroundColor;
                 if (fill && CGColorGetAlpha(fill) >= 0.6) {
@@ -465,7 +560,7 @@ static NigBackdrop NigBackdropExplainInner(UIView *view, NSString **why) {
                 UIView *s = siblings[(NSUInteger)i];
                 if (!CGRectContainsPoint(s.frame, pp)) continue;
                 NigBackdrop look;
-                if (NigSiblingLook(s, &look)) {
+                if (NigSiblingLook(s, pp, &look)) {
                     NIG_WHY(@"%@ %p below", NSStringFromClass([s class]), s);
                     return look;
                 }
@@ -597,6 +692,15 @@ static void NigApplyLabel(UILabel *label, BOOL active) {
     if (active && wantText != origText) NigStoreSet(label, kText, origText);
     else NigStoreRemove(label, kText);
     if (textChanged) label.textColor = wantText;  // flattens attributedText, redone below
+
+    // Selected tabs and cells often show the label highlighted, in a colour
+    // of its own (often near black).
+    UIColor *hl = label.highlightedTextColor;
+    if (hl || NigStoreGet(label, kHiText)) {
+        NigSyncColor(label, kHiText, hl, active,
+                     ^UIColor *(UIColor *o) { return NigDesiredText(label, o); },
+                     ^(UIColor *c) { label.highlightedTextColor = c; });
+    }
 
     if (custom) {
         NSAttributedString *wantAttr = active ? NigTransformAttr(origAttr, label) : origAttr;
@@ -1087,12 +1191,106 @@ static CGImageRef NigCopyRecoloredText(CGImageRef image) {
     return out;
 }
 
+// Edge fades: a small light bitmap of one colour whose alpha ramps along one
+// axis, laid over the end of a scrolling row to blend it into a light
+// surface. On a surface Nig darkened it shows as a white smear, so it takes
+// the colour Nig gives that light surface instead. Icons are not fades: their
+// alpha is all or nothing but for the edges, and varies across both axes.
+static CGImageRef NigCopyRecoloredFade(CGImageRef image) {
+    size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+    if (w < 2 || h < 2 || w * h > 250000) return NULL;
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, w * 4, space,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(space);
+    if (!ctx) return NULL;
+    CGContextSetBlendMode(ctx, kCGBlendModeCopy);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), image);
+    uint8_t *px = CGBitmapContextGetData(ctx);
+    if (!px) { CGContextRelease(ctx); return NULL; }
+
+    size_t count = w * h, partial = 0, colored = 0;
+    unsigned lo[3] = {255, 255, 255}, hi[3] = {0, 0, 0};
+    double sum[3] = {0, 0, 0};
+    for (size_t i = 0; i < count; i++) {
+        uint8_t *p = px + i * 4;
+        unsigned a = p[3];
+        if (a >= 16 && a <= 239) partial++;
+        if (a < 64) continue;
+        colored++;
+        for (int c = 0; c < 3; c++) {
+            unsigned v = MIN(255u, p[c] * 255u / a);
+            lo[c] = MIN(lo[c], v);
+            hi[c] = MAX(hi[c], v);
+            sum[c] += v;
+        }
+    }
+    BOOL fade = colored * 5 >= count && partial * 10 >= count * 3;
+    for (int c = 0; fade && c < 3; c++) fade = hi[c] - lo[c] <= 24;
+    CGFloat r = 0, g = 0, b = 0;
+    if (fade) {
+        r = sum[0] / colored / 255.0; g = sum[1] / colored / 255.0; b = sum[2] / colored / 255.0;
+        fade = NigLuma(r, g, b) > 0.8;
+    }
+    // Alpha constant down every column (a sideways fade) or along every row.
+    BOOL cols = fade, rows = fade;
+    for (size_t x = 0; cols && x < w; x++) {
+        unsigned amin = 255, amax = 0;
+        for (size_t y = 0; y < h; y++) {
+            unsigned a = px[(y * w + x) * 4 + 3];
+            amin = MIN(amin, a); amax = MAX(amax, a);
+        }
+        cols = amax - amin <= 20;
+    }
+    for (size_t y = 0; !cols && rows && y < h; y++) {
+        unsigned amin = 255, amax = 0;
+        for (size_t x = 0; x < w; x++) {
+            unsigned a = px[(y * w + x) * 4 + 3];
+            amin = MIN(amin, a); amax = MAX(amax, a);
+        }
+        rows = amax - amin <= 20;
+    }
+    CGFloat nr, ng, nb;
+    if (!fade || !(cols || rows) || !NigMapRGB(NigRoleBackground, r, g, b, &nr, &ng, &nb)) {
+        CGContextRelease(ctx);
+        return NULL;
+    }
+    for (size_t i = 0; i < count; i++) {
+        uint8_t *p = px + i * 4;
+        unsigned a = p[3];
+        p[0] = (uint8_t)lround(nr * a);
+        p[1] = (uint8_t)lround(ng * a);
+        p[2] = (uint8_t)lround(nb * a);
+    }
+    CGImageRef out = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    return out;
+}
+
+// Small self-contained views that show a bitmap the app set on their layer:
+// where edge fades live. Image views are left alone (their pictures are
+// never changed), and so are views with content of their own.
+static BOOL NigIsFadeCandidate(UIView *view) {
+    if ([view isKindOfClass:[UIImageView class]] || [view isKindOfClass:[UILabel class]] ||
+        [view isKindOfClass:[UITextField class]] || [view isKindOfClass:[UITextView class]]) {
+        return NO;
+    }
+    CGSize s = view.bounds.size;
+    return s.width > 0 && s.height > 0 && s.width * s.height <= 40000 && view.subviews.count == 0;
+}
+
+static BOOL NigIsRecolorCandidate(UIView *view) {
+    return NigIsAsyncTextView(view) || NigIsFadeCandidate(view);
+}
+
 // Sets the bitmap `view` should show for the app's `orig`, recording it.
 // A bitmap that is not text-like is recorded as skipped, so it is not
 // scanned again until the app sets another one.
 static void NigSetRecolored(UIView *view, id orig, BOOL want) {
     CALayer *layer = view.layer;
-    CGImageRef out = want ? NigCopyRecoloredText((__bridge CGImageRef)orig) : NULL;
+    CGImageRef out = !want ? NULL
+                     : NigIsAsyncTextView(view) ? NigCopyRecoloredText((__bridge CGImageRef)orig)
+                                                : NigCopyRecoloredFade((__bridge CGImageRef)orig);
     id target = orig;
     if (out) {
         id outObj = (__bridge_transfer id)out;
@@ -1126,7 +1324,7 @@ static void HookedLayerSetContents(CALayer *self, SEL _cmd, id contents) {
         return;
     }
     id delegate = self.delegate;
-    if (![delegate isKindOfClass:[UIView class]] || !NigIsAsyncTextView((UIView *)delegate)) {
+    if (![delegate isKindOfClass:[UIView class]] || !NigIsRecolorCandidate((UIView *)delegate)) {
         OrigLayerSetContents(self, _cmd, contents);
         return;
     }
@@ -1191,7 +1389,7 @@ static void NigApplySelf(UIView *view) {
     }
     NigApplyTextLayers(view, active);
     if (NigDrawsOwnBitmap(view)) NigApplyBitmapFilter(view, active);
-    if (NigIsAsyncTextView(view)) NigApplyRecolor(view, active);
+    if (NigIsRecolorCandidate(view)) NigApplyRecolor(view, active);
 
     // The window's tint is inherited by every view below it; touching each
     // subview's tint would break that inheritance.
@@ -1447,6 +1645,11 @@ static void NigDumpView(NSMutableString *out, UIView *v, int depth, NSUInteger *
         [out appendFormat:@"%@label \"%@\" tc=%@", detail, NigShort(l.text), NigHex(l.textColor)];
         NSString *tw = NigStoredDesc(l, kText);
         if (tw) [out appendFormat:@" was=%@", tw];
+        if (l.highlighted || l.highlightedTextColor) {
+            [out appendFormat:@" hl%@=%@", l.highlighted ? @"(on)" : @"", NigHex(l.highlightedTextColor)];
+            NSString *hw = NigStoredDesc(l, kHiText);
+            if (hw) [out appendFormat:@" hlwas=%@", hw];
+        }
         [out appendFormat:@" fg=[%@] runBg=[%@]%@\n", NigAttrColors(a, NSForegroundColorAttributeName),
                           NigAttrColors(a, NSBackgroundColorAttributeName),
                           NigStoreGet(l, kAttrOut) ? @" attr(nig)" : @""];
@@ -1539,6 +1742,7 @@ static void (*OrigSetBackgroundColor)(UIView *, SEL, UIColor *);
 static void (*OrigSetTintColor)(UIView *, SEL, UIColor *);
 static void (*OrigDidMoveToWindow)(UIView *, SEL);
 static void (*OrigLabelSetTextColor)(UILabel *, SEL, UIColor *);
+static void (*OrigLabelSetHighlightedTextColor)(UILabel *, SEL, UIColor *);
 static void (*OrigLabelSetAttributedText)(UILabel *, SEL, NSAttributedString *);
 static void (*OrigLayerSetBackgroundColor)(CALayer *, SEL, CGColorRef);
 static void (*OrigDrawLayerInContext)(UIView *, SEL, CALayer *, CGContextRef);
@@ -1675,6 +1879,23 @@ static void HookedLabelSetTextColor(UILabel *self, SEL _cmd, UIColor *color) {
     if (want) NigStoreSet(self, kText, orig); else NigStoreRemove(self, kText);
     tInHook = YES;
     OrigLabelSetTextColor(self, _cmd, want ?: orig);
+    tInHook = NO;
+}
+
+static void HookedLabelSetHighlightedTextColor(UILabel *self, SEL _cmd, UIColor *color) {
+    if (!NigShouldHandle(self) || !color) {
+        if (!tInHook && gEverActive && [NSThread isMainThread]) NigStoreRemove(self, kHiText);
+        OrigLabelSetHighlightedTextColor(self, _cmd, color);
+        return;
+    }
+    UIColor *stored = NigStoreGet(self, kHiText);
+    UIColor *orig = (stored && [color isEqual:self.highlightedTextColor]) ? stored : color;
+    NIG_WITH_TRAITS(self);
+    UIColor *want = NigDesiredText(self, orig);
+    NIG_END_TRAITS();
+    if (want) NigStoreSet(self, kHiText, orig); else NigStoreRemove(self, kHiText);
+    tInHook = YES;
+    OrigLabelSetHighlightedTextColor(self, _cmd, want ?: orig);
     tInHook = NO;
 }
 
@@ -1888,6 +2109,8 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                     (IMP)HookedImageSetImage, (IMP *)&OrigImageSetImage);
     MSHookMessageEx([UILabel class], @selector(setTextColor:),
                     (IMP)HookedLabelSetTextColor, (IMP *)&OrigLabelSetTextColor);
+    MSHookMessageEx([UILabel class], @selector(setHighlightedTextColor:),
+                    (IMP)HookedLabelSetHighlightedTextColor, (IMP *)&OrigLabelSetHighlightedTextColor);
     MSHookMessageEx([UILabel class], @selector(setAttributedText:),
                     (IMP)HookedLabelSetAttributedText, (IMP *)&OrigLabelSetAttributedText);
     MSHookMessageEx([CALayer class], @selector(setBackgroundColor:),
