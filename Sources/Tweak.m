@@ -919,6 +919,29 @@ static BOOL NigDrawsOwnBitmap(UIView *view) {
     return [NSStringFromClass([view class]) containsString:@"CGDrawingView"];
 }
 
+// Views that draw text glyphs into their own bitmap: UIKit's text views and
+// their private TextKit 2 fragment views, and the many third-party text
+// views (YYLabel, PDD's Lego text, ...) whose class names say so. Only their
+// dark fills are lightened while they draw onto a dark surface; images they
+// draw are untouched. Decided once per class.
+static NSString *const kDrawn = @"drawn";
+static BOOL NigIsTextRenderer(UIView *view) {
+    if ([view isKindOfClass:[UILabel class]] || [view isKindOfClass:[UITextField class]] ||
+        [view isKindOfClass:[UITextView class]]) {
+        return YES;
+    }
+    static CFMutableDictionaryRef cache;
+    Class cls = [view class];
+    if (!cache) cache = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);  // main thread only
+    const void *cached = CFDictionaryGetValue(cache, (__bridge const void *)cls);
+    if (cached) return cached == (const void *)1;
+    NSString *name = NSStringFromClass(cls);
+    BOOL text = ([name containsString:@"Text"] && ![name containsString:@"Texture"]) ||
+                [name containsString:@"Label"];
+    CFDictionarySetValue(cache, (__bridge const void *)cls, text ? (const void *)1 : (const void *)2);
+    return text;
+}
+
 // The style the app itself gives `view`: below a bar Nig forced dark, the
 // style of that bar's parent, not Nig's override.
 static UIUserInterfaceStyle NigAppStyle(UIView *view) {
@@ -975,6 +998,152 @@ static void NigApplyBitmapFilter(UIView *view, BOOL active) {
     }
 }
 
+#pragma mark - Text drawn off the main thread
+
+// Third-party text views (DinamicX's DXRichTextView, YYLabel, ...) render
+// their text into a CGImage on a background queue and hand it to the layer
+// as contents, so no drawing hook sees their colours. When such a bitmap
+// lands on a dark surface, its dark pixels get the same lighter, same-hue
+// colour Nig gives text; light and bright pixels stay. Only mostly
+// transparent bitmaps qualify: a photo or an opaque card is never touched.
+// It runs once per bitmap the app sets, never on a timer.
+static NSString *const kRecolor = @"recolor";  // @{ orig, out }: the app's bitmap and Nig's
+static void (*OrigLayerSetContents)(CALayer *, SEL, id);
+static BOOL NigShouldHandle(UIView *view);
+
+static BOOL NigIsAsyncTextView(UIView *view) {
+    if ([view isKindOfClass:[UILabel class]] || [view isKindOfClass:[UITextField class]] ||
+        [view isKindOfClass:[UITextView class]] || [view isKindOfClass:[UIImageView class]]) {
+        return NO;
+    }
+    return NigIsTextRenderer(view);
+}
+
+static BOOL NigIsClearColor(CGColorRef c) {
+    return !c || CGColorGetAlpha(c) < 0.05;
+}
+
+static BOOL NigWantsRecolor(UIView *view, BOOL active) {
+    return active && view.window && !view.hidden && view.subviews.count == 0 &&
+           NigIsClearColor(view.backgroundColor.CGColor) && NigIsClearColor(view.layer.backgroundColor) &&
+           NigAppStyle(view) != UIUserInterfaceStyleDark && NigTextBackdrop(view) == NigBackdropDark;
+}
+
+// The recoloured bitmap (+1), or NULL when it is not text-like or nothing changed.
+static CGImageRef NigCopyRecoloredText(CGImageRef image) {
+    size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+    if (w == 0 || h == 0 || w * h > 3000000) return NULL;
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, w * 4, space,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(space);
+    if (!ctx) return NULL;
+    CGContextSetBlendMode(ctx, kCGBlendModeCopy);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), image);
+    uint8_t *px = CGBitmapContextGetData(ctx);
+    size_t count = w * h;
+    if (!px) { CGContextRelease(ctx); return NULL; }
+
+    // Text is mostly empty space; a photo or a filled card is not.
+    size_t sampled = 0, clear = 0;
+    for (size_t i = 0; i < count; i += 7, sampled++) {
+        if (px[i * 4 + 3] < 26) clear++;
+    }
+    if (clear * 2 < sampled) { CGContextRelease(ctx); return NULL; }
+
+    // NigMapRGB for each 15-bit colour, filled as colours are met.
+    // Entry: 0 unknown, 1 keep, else 0x80000000 | 0xRRGGBB.
+    static uint32_t *table;
+    if (!table) table = calloc(32768, sizeof(uint32_t));
+    if (!table) { CGContextRelease(ctx); return NULL; }
+
+    size_t changed = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint8_t *p = px + i * 4;
+        unsigned a = p[3];
+        if (a < 8) continue;
+        unsigned r = MIN(255u, p[0] * 255u / a), g = MIN(255u, p[1] * 255u / a), b = MIN(255u, p[2] * 255u / a);
+        unsigned key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+        uint32_t entry = table[key];
+        if (!entry) {
+            CGFloat nr, ng, nb;
+            CGFloat cr = ((r >> 3) * 8 + 4) / 255.0, cg = ((g >> 3) * 8 + 4) / 255.0, cb = ((b >> 3) * 8 + 4) / 255.0;
+            if (NigMapRGB(NigRoleText, cr, cg, cb, &nr, &ng, &nb)) {
+                entry = 0x80000000u | ((uint32_t)lround(nr * 255) << 16) | ((uint32_t)lround(ng * 255) << 8) |
+                        (uint32_t)lround(nb * 255);
+            } else {
+                entry = 1;
+            }
+            table[key] = entry;
+        }
+        if (entry == 1) continue;
+        p[0] = (uint8_t)(((entry >> 16) & 0xFF) * a / 255);
+        p[1] = (uint8_t)(((entry >> 8) & 0xFF) * a / 255);
+        p[2] = (uint8_t)((entry & 0xFF) * a / 255);
+        changed++;
+    }
+    CGImageRef out = changed ? CGBitmapContextCreateImage(ctx) : NULL;
+    CGContextRelease(ctx);
+    return out;
+}
+
+// Sets the bitmap `view` should show for the app's `orig`, recording it.
+// A bitmap that is not text-like is recorded as skipped, so it is not
+// scanned again until the app sets another one.
+static void NigSetRecolored(UIView *view, id orig, BOOL want) {
+    CALayer *layer = view.layer;
+    CGImageRef out = want ? NigCopyRecoloredText((__bridge CGImageRef)orig) : NULL;
+    id target = orig;
+    if (out) {
+        id outObj = (__bridge_transfer id)out;
+        NigStoreSet(view, kRecolor, @{ @"orig": orig, @"out": outObj });
+        target = outObj;
+    } else if (want) {
+        NigStoreSet(view, kRecolor, @{ @"orig": orig, @"skip": @YES });
+    } else {
+        NigStoreRemove(view, kRecolor);
+    }
+    if (layer.contents != target) OrigLayerSetContents(layer, @selector(setContents:), target);
+}
+
+// Called from NigApplySelf: the surface or the style may have changed.
+static void NigApplyRecolor(UIView *view, BOOL active) {
+    id cur = view.layer.contents;
+    NSDictionary *rec = NigStoreGet(view, kRecolor);
+    BOOL ours = rec[@"out"] && cur == rec[@"out"];
+    BOOL skipped = rec[@"skip"] && cur == rec[@"orig"];
+    if (rec && !ours && !skipped) { NigStoreRemove(view, kRecolor); rec = nil; }
+    id orig = ours ? rec[@"orig"] : cur;
+    if (!NigIsCGImage(orig)) return;
+    BOOL want = NigWantsRecolor(view, active);
+    if (want == ours || (want && skipped)) return;  // already as it should be: no work
+    NigSetRecolored(view, orig, want);
+}
+
+static void HookedLayerSetContents(CALayer *self, SEL _cmd, id contents) {
+    if (tInHook || !NigIsCGImage(contents) || ![NSThread isMainThread]) {
+        OrigLayerSetContents(self, _cmd, contents);
+        return;
+    }
+    id delegate = self.delegate;
+    if (![delegate isKindOfClass:[UIView class]] || !NigIsAsyncTextView((UIView *)delegate)) {
+        OrigLayerSetContents(self, _cmd, contents);
+        return;
+    }
+    UIView *view = (UIView *)delegate;
+    if (NigShouldHandle(view) && NigWantsRecolor(view, gDarkModeActive)) {
+        BOOL previous = tInHook;
+        tInHook = YES;
+        NIG_WITH_TRAITS(view);
+        NigSetRecolored(view, contents, YES);
+        NIG_END_TRAITS();
+        tInHook = previous;
+        return;
+    }
+    if (NigStoreGet(view, kRecolor)) NigStoreRemove(view, kRecolor);
+    OrigLayerSetContents(self, _cmd, contents);
+}
+
 static void NigApplySelf(UIView *view) {
     if (!view || NigIsSystemUI(view)) return;
     BOOL active = gDarkModeActive;
@@ -1022,6 +1191,7 @@ static void NigApplySelf(UIView *view) {
     }
     NigApplyTextLayers(view, active);
     if (NigDrawsOwnBitmap(view)) NigApplyBitmapFilter(view, active);
+    if (NigIsAsyncTextView(view)) NigApplyRecolor(view, active);
 
     // The window's tint is inherited by every view below it; touching each
     // subview's tint would break that inheritance.
@@ -1037,6 +1207,17 @@ static void NigApplySelf(UIView *view) {
         NigSyncColor(view, kBorder, cur, active,
                      ^UIColor *(UIColor *o) { return NigTransformColor(o, NigRoleBorder); },
                      ^(UIColor *c) { view.layer.borderColor = c.CGColor; });
+    }
+
+    // A text view drawn before it reached its final place (or before the
+    // style changed) is drawn again, once, with the answer it has now.
+    NSNumber *drawn = NigStoreGet(view, kDrawn);
+    if (drawn) {
+        BOOL lighten = active && NigTextBackdrop(view) == NigBackdropDark;
+        if (lighten != drawn.boolValue) {
+            NigStoreSet(view, kDrawn, @(lighten));
+            [view.layer setNeedsDisplay];
+        }
     }
 
     NIG_END_TRAITS();
@@ -1245,6 +1426,8 @@ static void NigDumpView(NSMutableString *out, UIView *v, int depth, NSUInteger *
     if (layer.filters.count) [out appendFormat:@" filters=%lu%@", (unsigned long)layer.filters.count,
                                                 NigStoreGet(v, kInverted) ? @"(nig)" : @""];
     if (layer.mask) [out appendString:@" mask"];
+    NSDictionary *recolor = NigStoreGet(v, kRecolor);
+    if (recolor) [out appendString:recolor[@"out"] ? @" recolor(nig)" : @" recolor-skipped"];
     if (layer.borderWidth > 0) [out appendFormat:@" border=%@", NigHexCG(layer.borderColor)];
     if (v.overrideUserInterfaceStyle != UIUserInterfaceStyleUnspecified)
         [out appendFormat:@" override=%ld", (long)v.overrideUserInterfaceStyle];
@@ -1572,14 +1755,16 @@ static void HookedDrawLayerInContext(UIView *self, SEL _cmd, CALayer *layer, CGC
     int previous = tDrawState;
     BOOL prevBgValid = tDrawBgValid;
     CGFloat prevBg[3] = { tDrawBg[0], tDrawBg[1], tDrawBg[2] };
-    BOOL standardTextRenderer = [self isKindOfClass:[UILabel class]] ||
-                               [self isKindOfClass:[UITextField class]] ||
-                               [self isKindOfClass:[UITextView class]];
+    BOOL main = [NSThread isMainThread];
+    BOOL textRenderer = main && NigIsTextRenderer(self);
+    BOOL lighten = gDarkModeActive && !tInHook && textRenderer && !NigIsSystemUI(self) &&
+                   NigTextBackdrop(self) == NigBackdropDark;
+    // Remembered so that NigApplySelf redraws it only when the answer changes.
+    if (textRenderer && !tInHook) NigStoreSet(self, kDrawn, @(lighten));
     tDrawBgValid = NO;
     if (gDarkModeActive && !tInHook && NigShouldFilterBitmap(self, YES)) {
         tDrawState = 2;  // this small rasterized glyph is recoloured by its layer filter
-    } else if (gDarkModeActive && !tInHook && [NSThread isMainThread] && standardTextRenderer &&
-               !NigIsSystemUI(self) && NigTextBackdrop(self) == NigBackdropDark) {
+    } else if (lighten) {
         tDrawState = 1;
         // UIKit fills a self-drawing view's background into its own bitmap:
         // that fill is the (already dark) surface, not a glyph to lighten.
@@ -1707,6 +1892,8 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                     (IMP)HookedLabelSetAttributedText, (IMP *)&OrigLabelSetAttributedText);
     MSHookMessageEx([CALayer class], @selector(setBackgroundColor:),
                     (IMP)HookedLayerSetBackgroundColor, (IMP *)&OrigLayerSetBackgroundColor);
+    MSHookMessageEx([CALayer class], @selector(setContents:),
+                    (IMP)HookedLayerSetContents, (IMP *)&OrigLayerSetContents);
     MSHookMessageEx([UIView class], @selector(drawLayer:inContext:),
                     (IMP)HookedDrawLayerInContext, (IMP *)&OrigDrawLayerInContext);
     MSHookFunction((void *)CGContextSetFillColorWithColor,
