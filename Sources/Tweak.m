@@ -22,6 +22,10 @@
 #import <os/log.h>
 #import <notify.h>
 #import <substrate.h>
+// WebKit is reached at run time only (no link): apps without a web view
+// never load it because of Nig.
+#import <WebKit/WebKit.h>
+#import "NigWebScript.h"
 
 #pragma mark - Logging
 
@@ -1001,13 +1005,87 @@ static void NigApplySurfaceSublayers(CALayer *parent, BOOL active, NSInteger dep
 }
 
 // Bars and blur views follow the dark style natively, which also darkens
-// whatever is drawn by the system in them.
+// whatever is drawn by the system in them. So does a web view: pages that
+// have a dark design of their own (prefers-color-scheme) then use it.
+static BOOL NigIsWebView(UIView *view) {
+    static Class web;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ web = NSClassFromString(@"WKWebView"); });
+    return web && [view isKindOfClass:web];
+}
+
 static BOOL NigWantsDarkOverride(UIView *view) {
     if ([view isKindOfClass:[UIVisualEffectView class]]) {
         return [((UIVisualEffectView *)view).effect isKindOfClass:[UIBlurEffect class]];
     }
     return [view isKindOfClass:[UITabBar class]] || [view isKindOfClass:[UINavigationBar class]] ||
-           [view isKindOfClass:[UIToolbar class]];
+           [view isKindOfClass:[UIToolbar class]] || NigIsWebView(view);
+}
+
+#pragma mark - Web pages
+
+// Pages are recoloured by Web/NigWeb.js, element by element, with the same
+// rules as NigMapRGB. It runs in Nig's own content world, out of the page's
+// reach, as a user script for every page the web view loads from now on and,
+// once, in the page already shown.
+static NSString *const kWeb = @"web";
+static const void *kNigWebScriptKey = &kNigWebScriptKey;
+static NSString *const kNigWebMarker = @"/* nig-web";
+
+static WKContentWorld *NigWebWorld(void) {
+    static WKContentWorld *world;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        world = [NSClassFromString(@"WKContentWorld") worldWithName:@"com.imodcommission.nig"];
+    });
+    return world;
+}
+
+static NSString *NigWebSource(BOOL on) {
+    if (!on) return @"globalThis.__nigWeb && globalThis.__nigWeb.set(false);\n1;";
+    return [kNigWebEngine stringByAppendingString:@"globalThis.__nigWeb.set(true);\n1;"];
+}
+
+// Adding the script is all it takes to turn it on. A user script cannot be
+// removed alone: turning it off puts back every other script the app added.
+static void NigSyncWebScript(WKUserContentController *ucc, BOOL on) {
+    if (!ucc || !NigWebWorld()) return;
+    NSNumber *has = objc_getAssociatedObject(ucc, kNigWebScriptKey);
+    if (has.boolValue == on) return;
+    if (on) {
+        WKUserScript *mine = [[NSClassFromString(@"WKUserScript") alloc]
+              initWithSource:NigWebSource(YES)
+               injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+            forMainFrameOnly:NO
+              inContentWorld:NigWebWorld()];
+        [ucc addUserScript:mine];
+    } else {
+        NSMutableArray<WKUserScript *> *keep = [NSMutableArray array];
+        for (WKUserScript *s in ucc.userScripts) {
+            if (![s.source hasPrefix:kNigWebMarker]) [keep addObject:s];
+        }
+        [ucc removeAllUserScripts];
+        for (WKUserScript *s in keep) [ucc addUserScript:s];
+    }
+    objc_setAssociatedObject(ucc, kNigWebScriptKey, @(on), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void NigApplyWebView(UIView *view, BOOL active) {
+    NSNumber *state = NigStoreGet(view, kWeb);
+    if (state ? state.boolValue == active : !active) return;
+    WKWebView *web = (WKWebView *)view;
+    NigSyncWebScript(web.configuration.userContentController, active);
+    NigStoreSet(view, kWeb, @(active));
+    if (!web.URL || !NigWebWorld()) return;  // its first page gets the user script
+    [web evaluateJavaScript:NigWebSource(active)
+                    inFrame:nil
+             inContentWorld:NigWebWorld()
+          completionHandler:^(id result __unused, NSError *error) {
+        if (error) {
+            os_log(TweakLog(), "ApelinWeb error %{public}@ %{public}s",
+                   error.localizedDescription, getprogname());
+        }
+    }];
 }
 
 #pragma mark - Views that draw text as pixels
@@ -1388,6 +1466,7 @@ static void NigApplySelf(UIView *view) {
         NigApplyImageView((UIImageView *)view, active);
     }
     NigApplyTextLayers(view, active);
+    if (NigIsWebView(view)) NigApplyWebView(view, active);
     if (NigDrawsOwnBitmap(view)) NigApplyBitmapFilter(view, active);
     if (NigIsRecolorCandidate(view)) NigApplyRecolor(view, active);
 
@@ -1629,6 +1708,8 @@ static void NigDumpView(NSMutableString *out, UIView *v, int depth, NSUInteger *
     if (layer.borderWidth > 0) [out appendFormat:@" border=%@", NigHexCG(layer.borderColor)];
     if (v.overrideUserInterfaceStyle != UIUserInterfaceStyleUnspecified)
         [out appendFormat:@" override=%ld", (long)v.overrideUserInterfaceStyle];
+    NSNumber *web = NigStoreGet(v, kWeb);
+    if (web) [out appendFormat:@" web=%@", web.boolValue ? @"on" : @"off"];
     if (v.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) [out appendString:@" traitDark"];
     if (NigOverrides(cls, @selector(drawRect:))) [out appendString:@" drawRect"];
     if (NigOverrides(cls, @selector(drawLayer:inContext:))) [out appendString:@" drawLayer"];
