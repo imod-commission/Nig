@@ -121,8 +121,8 @@
     ],
     "tweakFilter": {
       "dylib": "tweak",
-      "bundles": [
-        "com.apple.UIKit"
+      "classes": [
+        "UIApplication"
       ]
     }
   }
