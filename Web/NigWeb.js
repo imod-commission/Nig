@@ -22,7 +22,7 @@
   var SIDES = ['top', 'right', 'bottom', 'left'];
   var SIG = ['color', 'background-color', 'background-image', 'background', 'border-color',
              'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color',
-             'fill', 'stroke'];
+             'fill', 'stroke', '-webkit-text-fill-color'];
   var OPTS = {childList: true, subtree: true, attributes: true,
               attributeFilter: ['class', 'style', 'id', 'hidden', 'open']};
 
@@ -283,6 +283,9 @@
       k.bg = cs.backgroundColor;
       k.bi = cs.backgroundImage;
       k.color = cs.color;
+      /* -webkit-text-fill-color paints the text instead of color when set. */
+      var tfc = cs.getPropertyValue('-webkit-text-fill-color');
+      k.tf = tfc && tfc !== k.color ? tfc : null;
       k.anim = !k.tx && animates(cs);
       k.bd = [];
       for (n = 0; n < 4; n++) {
@@ -344,11 +347,16 @@
         var bc = mapColor(BORDER, k.bd[n][1]);
         if (bc) setp(e2, r, k.bd[n][0], bc);
       }
-      /* Text: lightened on a dark backdrop, the page's own elsewhere. What
-         an element inherits is only written where it would come out wrong. */
+      /* Text: lightened on a dark backdrop, the page's own elsewhere. A
+         colour equal to the parent's may be inherited or the element's own
+         rule (body and a component both saying #333): it is left unwritten
+         only when it comes out right either way. */
       var want = b === DARK ? (mapColor(TEXT, k.co) || k.co) : k.co;
-      var shown = k.cur === null ? k.parent.out : k.cur;
-      if (want !== shown) setp(e2, r, 'color', want);
+      if (want !== k.color || (k.cur === null && want !== k.parent.out)) setp(e2, r, 'color', want);
+      if (k.tf) {
+        var tf = b === DARK ? mapColor(TEXT, k.tf) : null;
+        if (tf) setp(e2, r, '-webkit-text-fill-color', tf);
+      }
       k.out = want;
       r.co = k.co;
       r.cout = want;
@@ -389,8 +397,12 @@
     for (var i = 0; i < list.length; i++) {
       var m = list[i];
       if (m.type === 'childList') {
+        if (m.target.nodeName === 'STYLE') { full = true; continue; }  /* its rules changed */
         for (var j = 0; j < m.addedNodes.length; j++) {
-          if (m.addedNodes[j].nodeType === 1) pending.add(m.addedNodes[j]);
+          var a = m.addedNodes[j];
+          if (a.nodeType !== 1) continue;
+          if (a.tagName === 'STYLE' || a.tagName === 'LINK') full = true;  /* a link: again once loaded */
+          else pending.add(a);
         }
       } else {
         var t = m.target;
@@ -401,7 +413,7 @@
         pending.add(t);
       }
     }
-    if (pending.size) schedule();
+    if (pending.size || full) schedule();
   }
 
   function start() {
