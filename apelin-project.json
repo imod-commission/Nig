@@ -58,7 +58,8 @@
         "Foundation",
         "UIKit",
         "QuartzCore",
-        "CoreGraphics"
+        "CoreGraphics",
+        "Vision"
       ],
       "libraries": [
         "substrate"

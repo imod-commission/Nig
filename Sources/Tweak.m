@@ -20,11 +20,13 @@
 #import <objc/runtime.h>
 #import <os/lock.h>
 #import <os/log.h>
+#import <math.h>
 #import <notify.h>
 #import <substrate.h>
 // WebKit is reached at run time only (no link): apps without a web view
 // never load it because of Nig.
 #import <WebKit/WebKit.h>
+#import <Vision/Vision.h>
 #import "NigWebScript.h"
 
 #pragma mark - Logging
@@ -38,12 +40,77 @@ static os_log_t TweakLog(void) {
     return log;
 }
 
+#pragma mark - Barcode detection
+
+typedef void (^NigBarcodeCompletion)(NSArray<NSValue *> *rects);
+static dispatch_queue_t gBarcodeQueue;
+
+// Vision runs off the host's main thread. Results are normalized image-space
+// rectangles and delivered on main for UIKit/WebKit state updates.
+static void NigDetectBarcodes(CGImageRef image, NigBarcodeCompletion completion) {
+    if (!image || !completion) return;
+    CGImageRetain(image);
+    dispatch_async(gBarcodeQueue, ^{
+        @autoreleasepool {
+            VNDetectBarcodesRequest *request = [VNDetectBarcodesRequest new];
+            VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image options:@{}];
+            NSError *error = nil;
+            BOOL ok = [handler performRequests:@[request] error:&error];
+            NSMutableArray<NSValue *> *rects = [NSMutableArray array];
+            if (ok) {
+                for (VNBarcodeObservation *observation in request.results) {
+                    CGRect box = observation.boundingBox;
+                    if (!CGRectIsEmpty(box) && isfinite(box.origin.x) && isfinite(box.origin.y) &&
+                        isfinite(box.size.width) && isfinite(box.size.height)) {
+                        [rects addObject:[NSValue valueWithCGRect:box]];
+                    }
+                }
+            } else if (error) {
+                os_log(TweakLog(), "ApelinBarcode Vision error %{public}@", error.localizedDescription);
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(rects);
+                CGImageRelease(image);
+            });
+        }
+    });
+}
+
 #pragma mark - State
 
 // True while the system is dark AND the host app itself renders light.
 static BOOL gDarkModeActive = NO;
 static BOOL gEverActive = NO;
 static BOOL gRefreshPending = NO;
+static const void *kNigBarcodeSource = &kNigBarcodeSource;
+static const void *kNigBarcodeAnchorCount = &kNigBarcodeAnchorCount;
+static const void *kNigBarcodeAnchorForSource = &kNigBarcodeAnchorForSource;
+
+@interface NigBarcodeWeakViewBox : NSObject
+@property (nonatomic, weak) UIView *view;
+@end
+@implementation NigBarcodeWeakViewBox
+@end
+
+static BOOL NigHasBarcodeProtection(UIView *view) {
+    for (UIView *v = view; v; v = v.superview) {
+        if ([objc_getAssociatedObject(v, kNigBarcodeSource) boolValue] ||
+            [objc_getAssociatedObject(v, kNigBarcodeAnchorCount) unsignedIntegerValue] > 0) return YES;
+    }
+    return NO;
+}
+
+static void NigClearBarcodeProtection(UIView *view) {
+    if (![objc_getAssociatedObject(view, kNigBarcodeSource) boolValue]) return;
+    NigBarcodeWeakViewBox *box = objc_getAssociatedObject(view, kNigBarcodeAnchorForSource);
+    UIView *anchor = box.view;
+    objc_setAssociatedObject(view, kNigBarcodeSource, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, kNigBarcodeAnchorForSource, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!anchor) return;
+    NSUInteger count = [objc_getAssociatedObject(anchor, kNigBarcodeAnchorCount) unsignedIntegerValue];
+    if (count <= 1) objc_setAssociatedObject(anchor, kNigBarcodeAnchorCount, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    else objc_setAssociatedObject(anchor, kNigBarcodeAnchorCount, @(count - 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
 // Set while Nig itself changes a property, so the hooks let it through.
 static __thread BOOL tInHook = NO;
 // While a view draws itself: 1 = it sits on a surface Nig made dark, 2 = it does not,
@@ -997,6 +1064,8 @@ static void NigApplyLayerColors(CALayer *layer, BOOL active, BOOL own) {
 
 static void NigApplySurfaceSublayers(CALayer *parent, BOOL active, NSInteger depth) {
     if (depth > 4) return;
+    id delegate = parent.delegate;
+    if ([delegate isKindOfClass:[UIView class]] && NigHasBarcodeProtection((UIView *)delegate)) return;
     for (CALayer *s in [parent.sublayers copy]) {
         if (!NigIsPlainSublayer(s, parent)) continue;  // subview layers and small shapes stay
         NigApplyLayerColors(s, active, NO);
@@ -1396,7 +1465,33 @@ static void NigApplyRecolor(UIView *view, BOOL active) {
     NigSetRecolored(view, orig, want);
 }
 
+static void NigProtectBarcodeView(UIView *view);
+static void NigScheduleSettle(UIView *view);
+
 static void HookedLayerSetContents(CALayer *self, SEL _cmd, id contents) {
+    if (!tInHook && [NSThread isMainThread]) {
+        id delegate = self.delegate;
+        if ([delegate isKindOfClass:[UIView class]]) {
+            UIView *view = delegate;
+            BOOL hadProtection = [objc_getAssociatedObject(view, kNigBarcodeSource) boolValue];
+            NigClearBarcodeProtection(view);
+            if (hadProtection) NigScheduleSettle(view);
+        }
+        if (NigIsCGImage(contents) && [delegate isKindOfClass:[UIView class]] &&
+            ![delegate isKindOfClass:[UIImageView class]]) {
+            __weak UIView *weakView = delegate;
+            __weak CALayer *weakLayer = self;
+            id sourceObject = contents;
+            NigDetectBarcodes((__bridge CGImageRef)contents, ^(NSArray<NSValue *> *rects) {
+                UIView *view = weakView;
+                CALayer *layer = weakLayer;
+                if (!view || !layer || rects.count == 0 || layer.contents != sourceObject) return;
+                NigProtectBarcodeView(view);
+                os_log(TweakLog(), "ApelinBarcode layer detected count=%lu %{public}s",
+                       (unsigned long)rects.count, getprogname());
+            });
+        }
+    }
     if (tInHook || !NigIsCGImage(contents) || ![NSThread isMainThread]) {
         OrigLayerSetContents(self, _cmd, contents);
         return;
@@ -1422,7 +1517,7 @@ static void HookedLayerSetContents(CALayer *self, SEL _cmd, id contents) {
 
 static void NigApplySelf(UIView *view) {
     if (!view || NigIsSystemUI(view)) return;
-    BOOL active = gDarkModeActive;
+    BOOL active = gDarkModeActive && !NigHasBarcodeProtection(view);
     BOOL previous = tInHook;
     tInHook = YES;
     NIG_WITH_TRAITS(view);
@@ -1834,7 +1929,7 @@ static void NigScheduleSettle(UIView *view);
 
 // A hook only does Nig's work on the main thread, for views Nig may touch.
 static BOOL NigShouldHandle(UIView *view) {
-    if (tInHook || !gDarkModeActive || ![NSThread isMainThread]) return NO;
+    if (tInHook || !gDarkModeActive || ![NSThread isMainThread] || NigHasBarcodeProtection(view)) return NO;
     return !NigIsSystemUI(view);
 }
 
@@ -1933,8 +2028,41 @@ static void HookedDidMoveToWindow(UIView *self, SEL _cmd) {
 
 static void (*OrigImageSetImage)(UIImageView *, SEL, UIImage *);
 
+static void NigProtectBarcodeView(UIView *view) {
+    if (!view || [objc_getAssociatedObject(view, kNigBarcodeSource) boolValue]) return;
+    UIView *anchor = view;
+    for (UIView *p = view.superview; p; p = p.superview) {
+        anchor = p;
+        CGFloat a = p.backgroundColor ? CGColorGetAlpha(p.backgroundColor.CGColor) : 0;
+        if (a >= 0.5) break;
+        a = p.layer.backgroundColor ? CGColorGetAlpha(p.layer.backgroundColor) : 0;
+        if (a >= 0.5) break;
+    }
+    NSUInteger count = [objc_getAssociatedObject(anchor, kNigBarcodeAnchorCount) unsignedIntegerValue];
+    NigBarcodeWeakViewBox *box = [NigBarcodeWeakViewBox new];
+    box.view = anchor;
+    objc_setAssociatedObject(view, kNigBarcodeSource, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, kNigBarcodeAnchorForSource, box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(anchor, kNigBarcodeAnchorCount, @(count + 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NigApplyTree(anchor, 0);
+}
+
 static void HookedImageSetImage(UIImageView *self, SEL _cmd, UIImage *image) {
+    BOOL hadProtection = [objc_getAssociatedObject(self, kNigBarcodeSource) boolValue];
+    NigClearBarcodeProtection(self);
     OrigImageSetImage(self, _cmd, image);
+    if (hadProtection && self.window) NigScheduleSettle(self);
+    if (image.CGImage) {
+        __weak UIImageView *weakView = self;
+        CGImageRef source = image.CGImage;
+        NigDetectBarcodes(source, ^(NSArray<NSValue *> *rects) {
+            UIImageView *view = weakView;
+            if (!view || rects.count == 0 || view.image.CGImage != source) return;
+            NigProtectBarcodeView(view);
+            os_log(TweakLog(), "ApelinBarcode native detected count=%lu %{public}s",
+                   (unsigned long)rects.count, getprogname());
+        });
+    }
     if (NigShouldHandle(self) && self.window) {
         tInHook = YES;
         NIG_WITH_TRAITS(self);
@@ -2179,6 +2307,7 @@ __attribute__((constructor)) static void TweakInitialize(void) {
         return;
     }
     if (!NigShouldRunInThisProcess()) return;
+    gBarcodeQueue = dispatch_queue_create("com.imodcommission.nig.barcode", DISPATCH_QUEUE_CONCURRENT);
 
     MSHookMessageEx([UIView class], @selector(setBackgroundColor:),
                     (IMP)HookedSetBackgroundColor, (IMP *)&OrigSetBackgroundColor);
