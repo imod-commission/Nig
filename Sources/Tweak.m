@@ -636,8 +636,8 @@ static NSAttributedString *NigTransformAttr(NSAttributedString *attr, UIView *vi
     return m ?: attr;
 }
 
-// YES when some run carries a colour other than the label's own textColor.
-static BOOL NigAttrHasCustomColors(NSAttributedString *attr, UIColor *base) {
+// YES when some run carries an explicit text-related colour or background.
+static BOOL NigAttrHasCustomColors(NSAttributedString *attr) {
     __block BOOL custom = NO;
     NSArray<NSString *> *textKeys = @[NSForegroundColorAttributeName, NSUnderlineColorAttributeName,
                                       NSStrikethroughColorAttributeName, NSStrokeColorAttributeName];
@@ -646,7 +646,9 @@ static BOOL NigAttrHasCustomColors(NSAttributedString *attr, UIColor *base) {
                          inRange:NSMakeRange(0, attr.length)
                          options:0
                       usingBlock:^(id value, NSRange range __unused, BOOL *stop) {
-            if ([value isKindOfClass:[UIColor class]] && ![value isEqual:base]) {
+            // Even an explicit run colour equal to UILabel.textColor overrides
+            // textColor during rendering, so transform it as an attributed run.
+            if ([value isKindOfClass:[UIColor class]]) {
                 custom = YES;
                 *stop = YES;
             }
@@ -689,7 +691,7 @@ static void NigApplyLabel(UILabel *label, BOOL active) {
 
     UIColor *storedText = NigStoreGet(label, kText);
     UIColor *origText = storedText ?: curText;
-    BOOL custom = origAttr.length > 0 && origText && NigAttrHasCustomColors(origAttr, origText);
+    BOOL custom = origAttr.length > 0 && NigAttrHasCustomColors(origAttr);
 
     UIColor *wantText = active ? (NigDesiredText(label, origText) ?: origText) : origText;
     BOOL textChanged = wantText && ![curText isEqual:wantText];
