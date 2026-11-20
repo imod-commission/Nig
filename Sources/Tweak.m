@@ -85,6 +85,9 @@ static BOOL gRefreshPending = NO;
 static const void *kNigBarcodeSource = &kNigBarcodeSource;
 static const void *kNigBarcodeAnchorCount = &kNigBarcodeAnchorCount;
 static const void *kNigBarcodeAnchorForSource = &kNigBarcodeAnchorForSource;
+static const void *kNigBarcodeSnapshotToken = &kNigBarcodeSnapshotToken;
+static const void *kNigBarcodeLastSnapshotTime = &kNigBarcodeLastSnapshotTime;
+static NSUInteger gBarcodeSnapshotBudget = 0;
 
 @interface NigBarcodeWeakViewBox : NSObject
 @property (nonatomic, weak) UIView *view;
@@ -1596,8 +1599,11 @@ static void NigApplySelf(UIView *view) {
     tInHook = previous;
 }
 
+static void NigScanCompositeBarcodeView(UIView *view);
+
 static void NigApplyTree(UIView *view, NSInteger depth) {
     if (!view || depth > 200) return;
+    NigScanCompositeBarcodeView(view);
     NigApplySelf(view);
     for (UIView *sub in [view.subviews copy]) {
         NigApplyTree(sub, depth + 1);
@@ -1645,6 +1651,7 @@ static void NigRefresh(void) {
     if (!gEverActive) return;  // nothing was ever changed, nothing to restore
 
     for (UIWindow *w in windows) {
+        gBarcodeSnapshotBudget = 0;
         NigApplyTree(w, 0);
     }
 }
@@ -1690,9 +1697,12 @@ static NSString *NigContentsDesc(id contents) {
         CGImageRef i = (__bridge CGImageRef)contents;
         return [NSString stringWithFormat:@"CGImage %zux%zu", CGImageGetWidth(i), CGImageGetHeight(i)];
     }
-    CFStringRef d = CFCopyTypeIDDescription(t);
-    NSString *s = d ? [(__bridge_transfer NSString *)d copy] : @"?";
-    return s;
+    // Layer contents can be a plain Objective-C object (IOSurface, a backing
+    // store), whose type ID CoreFoundation never registered: describing it
+    // with CFCopyTypeIDDescription crashes (dpoint, on screenshot). The class
+    // name is always safe to read.
+    Class cls = object_getClass(contents);
+    return cls ? [NSString stringWithUTF8String:class_getName(cls)] : @"?";
 }
 
 static NSString *NigShort(NSString *text) {
@@ -2045,6 +2055,55 @@ static void NigProtectBarcodeView(UIView *view) {
     objc_setAssociatedObject(view, kNigBarcodeAnchorForSource, box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(anchor, kNigBarcodeAnchorCount, @(count + 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     NigApplyTree(anchor, 0);
+}
+
+// Some apps draw codes from many vector/layer pieces rather than assigning an
+// image. Snapshot only compact, structurally complex candidate views, locally,
+// then ask Vision to inspect the rendered result off the main thread. No image
+// leaves the app, and no fallback surface is inserted.
+static void NigScanCompositeBarcodeView(UIView *view) {
+    if (!gDarkModeActive || !view.window || ![NSThread isMainThread] ||
+        [view isKindOfClass:[UIImageView class]] || NigIsWebView(view) ||
+        NigHasBarcodeProtection(view) || gBarcodeSnapshotBudget >= 6) return;
+
+    CGSize size = view.bounds.size;
+    CGFloat area = size.width * size.height;
+    CGFloat windowArea = view.window.bounds.size.width * view.window.bounds.size.height;
+    if (size.width < 120 || size.height < 48 || area < 12000 ||
+        area > windowArea * 0.72 || area > 900000) return;
+
+    NSUInteger layerCount = view.layer.sublayers.count;
+    NSUInteger childCount = view.subviews.count;
+    NSString *name = NSStringFromClass([view class]).lowercaseString;
+    BOOL named = [name containsString:@"barcode"] || [name containsString:@"qrcode"] ||
+                 [name containsString:@"qrview"] || [name containsString:@"codeview"];
+    if (!named && layerCount < 16 && childCount < 8) return;
+
+    CFTimeInterval now = CACurrentMediaTime();
+    NSNumber *last = objc_getAssociatedObject(view, kNigBarcodeLastSnapshotTime);
+    if (last && now - last.doubleValue < 2.0) return;
+    objc_setAssociatedObject(view, kNigBarcodeLastSnapshotTime, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    id token = [NSObject new];
+    objc_setAssociatedObject(view, kNigBarcodeSnapshotToken, token, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gBarcodeSnapshotBudget++;
+
+    UIGraphicsBeginImageContextWithOptions(size, NO, 1.0);
+    BOOL rendered = [view drawViewHierarchyInRect:(CGRect){CGPointZero, size} afterScreenUpdates:NO];
+    UIImage *snapshot = rendered ? UIGraphicsGetImageFromCurrentImageContext() : nil;
+    UIGraphicsEndImageContext();
+    CGImageRef image = snapshot.CGImage;
+    if (!image) return;
+
+    __weak UIView *weakView = view;
+    NigDetectBarcodes(image, ^(NSArray<NSValue *> *rects) {
+        UIView *current = weakView;
+        if (!current || !current.window || rects.count == 0 ||
+            objc_getAssociatedObject(current, kNigBarcodeSnapshotToken) != token) return;
+        NigProtectBarcodeView(current);
+        os_log(TweakLog(), "ApelinBarcode composite detected count=%lu %{public}s",
+               (unsigned long)rects.count, getprogname());
+    });
 }
 
 static void HookedImageSetImage(UIImageView *self, SEL _cmd, UIImage *image) {
