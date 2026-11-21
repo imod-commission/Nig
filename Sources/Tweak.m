@@ -1086,10 +1086,13 @@ static BOOL NigIsWebView(UIView *view) {
     return web && [view isKindOfClass:web];
 }
 
+static BOOL gFlutterApp = NO;  // see "Flutter apps" below
+
 static BOOL NigWantsDarkOverride(UIView *view) {
     if ([view isKindOfClass:[UIVisualEffectView class]]) {
         return [((UIVisualEffectView *)view).effect isKindOfClass:[UIBlurEffect class]];
     }
+    if (gFlutterApp && [view isKindOfClass:[UIWindow class]]) return YES;
     return [view isKindOfClass:[UITabBar class]] || [view isKindOfClass:[UINavigationBar class]] ||
            [view isKindOfClass:[UIToolbar class]] || NigIsWebView(view);
 }
@@ -1226,16 +1229,15 @@ static NSArray *NigInvertFilters(void) {
     return @[invert, hue];
 }
 
-static void NigApplyBitmapFilter(UIView *view, BOOL active) {
-    BOOL want = NigShouldFilterBitmap(view, active);
-    NSDictionary *rec = NigStoreGet(view, kInverted);
+static void NigSetInvertFilter(UIView *view, NSString *key, BOOL want) {
+    NSDictionary *rec = NigStoreGet(view, key);
     CALayer *layer = view.layer;
     if (want && !rec) {
         NSArray *ours = NigInvertFilters();
         if (!ours) return;
         NSMutableArray *combined = [NSMutableArray arrayWithArray:layer.filters ?: @[]];
         [combined addObjectsFromArray:ours];
-        NigStoreSet(view, kInverted, @{ @"ours": ours });
+        NigStoreSet(view, key, @{ @"ours": ours });
         layer.filters = combined;
     } else if (!want && rec) {
         NSArray *ours = rec[@"ours"];
@@ -1248,10 +1250,22 @@ static void NigApplyBitmapFilter(UIView *view, BOOL active) {
             if (!isOurs) [remaining addObject:filter];
         }
         layer.filters = remaining.count ? remaining : nil;
-        NigStoreRemove(view, kInverted);
+        NigStoreRemove(view, key);
     }
 }
 
+static void NigApplyBitmapFilter(UIView *view, BOOL active) {
+    NigSetInvertFilter(view, kInverted, NigShouldFilterBitmap(view, active));
+}
+
+#pragma mark - Flutter apps
+
+// Flutter draws a whole screen itself, into one Metal layer, so there are no
+// UIKit colours to change, and inverting that layer would also swap barcodes
+// and photos. What Nig can do honestly is tell Flutter the system is dark: the
+// engine reads the platform brightness from the window's traits (an app that
+// locks itself to Light in its Info.plist gets the same answer). An app with a
+// dark theme then draws it; an app without one stays as it is.
 #pragma mark - Text drawn off the main thread
 
 // Third-party text views (DinamicX's DXRichTextView, YYLabel, ...) render
@@ -1633,6 +1647,7 @@ static void NigRefresh(void) {
     UIWindow *probe = NigProbeWindow(windows);
     if (!probe) return;  // no window yet: a later notification retries
 
+    if (!gFlutterApp) gFlutterApp = NSClassFromString(@"FlutterView") != Nil;
     BOOL system = NigSystemIsDark(YES);
     // Dynamic colours are read the way the app itself resolves them.
     BOOL traitDark = (probe.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
@@ -2367,6 +2382,7 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     }
     if (!NigShouldRunInThisProcess()) return;
     gBarcodeQueue = dispatch_queue_create("com.imodcommission.nig.barcode", DISPATCH_QUEUE_CONCURRENT);
+    gFlutterApp = NSClassFromString(@"FlutterView") != Nil;
 
     MSHookMessageEx([UIView class], @selector(setBackgroundColor:),
                     (IMP)HookedSetBackgroundColor, (IMP *)&OrigSetBackgroundColor);
