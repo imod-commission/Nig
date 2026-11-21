@@ -167,9 +167,9 @@
   "package": {
     "id": "com.imodcommission.nig",
     "name": "Nig",
-    "version": "1.6.1",
-    "description": "为未适配暗黑模式的应用自动启用暗黑模式效果。Dark mode for apps that do not support it.",
-    "icon": "https://owngoal-dev.github.io/Apelin/icons/wiki.qaq.apelin.dev.tweak.png",
+    "version": "1.0.0",
+    "description": "Night mode for unsupported apps and websites!",
+    "icon": "https://raw.githubusercontent.com/imod-commission/Nig/main/assets/icon.png",
     "author": "imod_commission",
     "section": "Tweaks",
     "depends": [
@@ -216,6 +216,16 @@
       "classes": [
         "UIApplication"
       ]
-    }
+    },
+    "longDescription": [
+      "Night mode for apps and websites that do not have a dark theme.",
+      "Nig follows the system appearance: when iOS is in Dark mode it recolours",
+      "UIKit apps and the web pages shown in Safari, in-app browsers and web views.",
+      "Dark colours become a lighter shade of the same hue, photos and QR codes are left alone.",
+      "Exclude a single app with Choicy, or a website in the Nig settings pane.",
+      "Nig cannot recolour apps that draw their own UI (Flutter, games, some cross-platform apps)",
+      "and it does not work in every app: some will look wrong or be left unchanged.",
+      "Packages for rootless and roothide jailbreaks."
+    ]
   }
 }

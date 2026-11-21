@@ -2,7 +2,7 @@
 //
 // Nig: dark mode for apps that do not support it.
 //
-// Ported from the Logos tweak (Tweak.xm) to Apelin's plain Objective-C hooks.
+// Plain Objective-C hooks installed with MSHookMessageEx.
 // Design notes (what changed from the original and why):
 //  * Dark colours become a LIGHTER COUNTERPART OF THE SAME COLOUR (hue kept),
 //    not flat white. Neutral greys stay grey, so hierarchy survives.
@@ -30,7 +30,7 @@
 #import <WebKit/WebKit.h>
 #import <Vision/Vision.h>
 #import "NigWebScript.h"
-#import "ApelinBootstrap.h"
+#import "NigPaths.h"
 #import "NigSites.h"
 
 #pragma mark - Logging
@@ -39,7 +39,7 @@ static os_log_t TweakLog(void) {
     static os_log_t log;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        log = os_log_create(APELIN_PACKAGE_ID, "tweak");
+        log = os_log_create(NIG_PACKAGE_ID, "tweak");
     });
     return log;
 }
@@ -70,7 +70,7 @@ static void NigDetectBarcodes(CGImageRef image, NigBarcodeCompletion completion)
                     }
                 }
             } else if (error) {
-                os_log(TweakLog(), "ApelinBarcode Vision error %{public}@", error.localizedDescription);
+                os_log(TweakLog(), "NigBarcode Vision error %{public}@", error.localizedDescription);
             }
             dispatch_async(dispatch_get_main_queue(), ^{
                 completion(rects);
@@ -354,7 +354,7 @@ static void NigPublishStyleIfChanged(void) {
     last = now;
     notify_set_state(token, now);
     notify_post(kStyleNotification);
-    os_log(TweakLog(), "ApelinPublished style=%llu", now);
+    os_log(TweakLog(), "NigPublished style=%llu", now);
 }
 
 static BOOL NigSystemIsDark(BOOL allowScreen) {
@@ -378,7 +378,7 @@ static BOOL NigSystemIsDark(BOOL allowScreen) {
 // domain, so SpringBoard reads them and publishes them as the state of
 // kPrefsNotification, as it does the style. 0 (also: not published yet) is
 // the default, everything on; bit 0 = Nig off, bit 1 = web pages off.
-static const char *const kPrefsChanged = APELIN_PACKAGE_ID "/changed";
+static const char *const kPrefsChanged = NIG_PACKAGE_ID "/changed";
 static const char *const kPrefsNotification = "com.imodcommission.nig.prefs";
 static BOOL gNigEnabled = YES;  // read in NigRefresh
 static BOOL gWebEnabled = YES;  // web pages inside apps
@@ -388,7 +388,7 @@ static BOOL gWebOnly = NO;
 static BOOL gWebActive = NO;    // the pages are recoloured now
 
 static BOOL NigPrefBool(CFStringRef key, BOOL fallback) {
-    CFPropertyListRef v = CFPreferencesCopyAppValue(key, CFSTR(APELIN_PACKAGE_ID));
+    CFPropertyListRef v = CFPreferencesCopyAppValue(key, CFSTR(NIG_PACKAGE_ID));
     BOOL out = fallback;
     if (v && CFGetTypeID(v) == CFBooleanGetTypeID()) {
         out = CFBooleanGetValue((CFBooleanRef)v);
@@ -405,7 +405,7 @@ static BOOL NigPrefBool(CFStringRef key, BOOL fallback) {
 // read, so SpringBoard copies them, cleaned, into a file under the bootstrap's
 // own var that every app can read. Apps look at it when the prefs change.
 static NSString *NigBlocklistPath(void) {
-    return ApelinBootstrapPath(@"/var/mobile/Library/Nig/excluded-sites.plist");
+    return NigRootPath(@"/var/mobile/Library/Nig/excluded-sites.plist");
 }
 
 // SpringBoard only.
@@ -413,7 +413,7 @@ static void NigPublishBlocklist(void) {
     NSString *path = NigBlocklistPath();
     if (!path) return;
     NSArray<NSString *> *list = NigNormalizedSites(
-        CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("blockedSites"), CFSTR(APELIN_PACKAGE_ID))));
+        CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("blockedSites"), CFSTR(NIG_PACKAGE_ID))));
     NSArray *have = [NSArray arrayWithContentsOfFile:path];
     if (have && [have isEqual:list]) return;
     NSError *error = nil;
@@ -423,7 +423,7 @@ static void NigPublishBlocklist(void) {
                                                     error:&error];
     BOOL ok = [list writeToFile:path atomically:YES];
     if (ok) chmod(path.fileSystemRepresentation, 0644);
-    os_log(TweakLog(), "ApelinBlocklist written=%d sites=%lu", ok, (unsigned long)list.count);
+    os_log(TweakLog(), "NigBlocklist written=%d sites=%lu", ok, (unsigned long)list.count);
 }
 
 // Apps only: the list as the last refresh read it, and its generation, which
@@ -441,7 +441,7 @@ static void NigReadBlocklist(void) {
     if (stat(path.fileSystemRepresentation, &st) != 0) {
         if (errno != ENOENT && !reported) {
             reported = YES;
-            os_log(TweakLog(), "ApelinBlocklist unreadable errno=%d %{public}s", errno, getprogname());
+            os_log(TweakLog(), "NigBlocklist unreadable errno=%d %{public}s", errno, getprogname());
         }
         lastSize = -1;
         if (gBlockedSites.count) {
@@ -460,7 +460,7 @@ static void NigReadBlocklist(void) {
     if (![list isEqual:gBlockedSites ?: @[]]) {
         gBlockedSites = list;
         gBlockGen++;
-        os_log(TweakLog(), "ApelinBlocklist sites=%lu %{public}s", (unsigned long)list.count, getprogname());
+        os_log(TweakLog(), "NigBlocklist sites=%lu %{public}s", (unsigned long)list.count, getprogname());
     }
 }
 
@@ -472,12 +472,12 @@ static void NigPublishPrefs(void) {
         token = NOTIFY_TOKEN_INVALID;
         return;
     }
-    CFPreferencesAppSynchronize(CFSTR(APELIN_PACKAGE_ID));
+    CFPreferencesAppSynchronize(CFSTR(NIG_PACKAGE_ID));
     NigPublishBlocklist();
     uint64_t state = (NigPrefBool(CFSTR("enabled"), YES) ? 0 : 1) | (NigPrefBool(CFSTR("web"), YES) ? 0 : 2);
     notify_set_state(token, state);
     notify_post(kPrefsNotification);
-    os_log(TweakLog(), "ApelinPrefs state=%llu", state);
+    os_log(TweakLog(), "NigPrefs state=%llu", state);
 }
 
 static void NigReadPrefs(void) {
@@ -666,9 +666,7 @@ static BOOL NigSiblingLook(UIView *s, CGPoint pp, NigBackdrop *out) {
 // the view itself, then what its parent paints below it (earlier siblings
 // that cover it: SwiftUI and many apps put a card or a gradient beside the
 // text rather than above it), then the parent, and so on up.
-// `why`, when given, names the view or layer that decided (for the dump).
-#define NIG_WHY(fmt, ...) do { if (why) *why = [NSString stringWithFormat:fmt, ##__VA_ARGS__]; } while (0)
-static NigBackdrop NigBackdropExplainInner(UIView *view, NSString **why) {
+static NigBackdrop NigBackdropInner(UIView *view) {
     NSInteger depth = 0;
     CGPoint p = CGPointMake(CGRectGetMidX(view.bounds), CGRectGetMidY(view.bounds));
     for (UIView *v = view; v && depth < 60; v = v.superview, depth++) {
@@ -676,24 +674,20 @@ static NigBackdrop NigBackdropExplainInner(UIView *view, NSString **why) {
         tTraits = vt;
         // Blur bars are forced dark by Nig (see NigApplySelf).
         if ([v isKindOfClass:[UIVisualEffectView class]]) {
-            NIG_WHY(@"%@ %p effect", NSStringFromClass([v class]), v);
             return NigBackdropDark;
         }
         CALayer *layer = v.layer;
 
         if (v != view) {
             if ([v isKindOfClass:[UIImageView class]] && ((UIImageView *)v).image) {
-                NIG_WHY(@"%@ %p image", NSStringFromClass([v class]), v);
                 return NigBackdropMedia;
             }
             if ([layer isKindOfClass:[CAGradientLayer class]]) {
-                NIG_WHY(@"%@ %p gradient", NSStringFromClass([v class]), v);
                 return NigBackdropMedia;
             }
             if (NigIsCGImage(layer.contents)) {
                 NigBackdrop look;
                 if (NigImageLookAt(layer, p, &look)) {
-                    NIG_WHY(@"%@ %p contents", NSStringFromClass([v class]), v);
                     return look;
                 }
             }
@@ -704,14 +698,12 @@ static NigBackdrop NigBackdropExplainInner(UIView *view, NSString **why) {
                 CALayer *s = subs[i];
                 if (!NigIsPlainSublayer(s, layer)) continue;
                 if ([s isKindOfClass:[CAGradientLayer class]]) {
-                    NIG_WHY(@"%@ %p sublayer %@ media", NSStringFromClass([v class]), v, NSStringFromClass([s class]));
                     return NigBackdropMedia;
                 }
                 if (NigIsCGImage(s.contents)) {
                     CGPoint sp = [layer convertPoint:p toLayer:s];
                     NigBackdrop look;
                     if (CGRectContainsPoint(s.bounds, sp) && NigImageLookAt(s, sp, &look)) {
-                        NIG_WHY(@"%@ %p sublayer %@ image", NSStringFromClass([v class]), v, NSStringFromClass([s class]));
                         return look;
                     }
                     continue;
@@ -720,7 +712,6 @@ static NigBackdrop NigBackdropExplainInner(UIView *view, NSString **why) {
                 if (fill && CGColorGetAlpha(fill) >= 0.6) {
                     UIColor *c = [UIColor colorWithCGColor:fill];
                     CGFloat r, g, b, a;
-                    NIG_WHY(@"%@ %p sublayer %@ %p fill", NSStringFromClass([v class]), v, NSStringFromClass([s class]), s);
                     if (NigGetRGBA(c, &r, &g, &b, &a)) {
                         return NigLuma(r, g, b) > 0.55 ? NigBackdropLight : NigBackdropDark;
                     }
@@ -733,17 +724,14 @@ static NigBackdrop NigBackdropExplainInner(UIView *view, NSString **why) {
         if (bg) {
             CGFloat r, g, b, a;
             if (!NigGetRGBA(bg, &r, &g, &b, &a)) {
-                NIG_WHY(@"%@ %p pattern", NSStringFromClass([v class]), v);
                 return NigBackdropMedia;  // pattern colour
             }
             if (a >= 0.6) {
-                NIG_WHY(@"%@ %p bg", NSStringFromClass([v class]), v);
                 return NigLuma(r, g, b) > 0.55 ? NigBackdropLight : NigBackdropDark;
             }
         } else if (layer.backgroundColor && CGColorGetAlpha(layer.backgroundColor) >= 0.6) {
             CGFloat r, g, b, a;
             if (NigGetRGBA([UIColor colorWithCGColor:layer.backgroundColor], &r, &g, &b, &a)) {
-                NIG_WHY(@"%@ %p layerBg", NSStringFromClass([v class]), v);
                 return NigLuma(r, g, b) > 0.55 ? NigBackdropLight : NigBackdropDark;
             }
         }
@@ -761,26 +749,20 @@ static NigBackdrop NigBackdropExplainInner(UIView *view, NSString **why) {
                 if (!CGRectContainsPoint(s.frame, pp)) continue;
                 NigBackdrop look;
                 if (NigSiblingLook(s, pp, &look)) {
-                    NIG_WHY(@"%@ %p below", NSStringFromClass([s class]), s);
                     return look;
                 }
             }
         }
         p = pp;
     }
-    NIG_WHY(@"nothing solid up to the window");
     return NigBackdropMedia;
 }
 
-static NigBackdrop NigBackdropExplain(UIView *view, NSString **why) {
+static NigBackdrop NigBackdropOf(UIView *view) {
     UITraitCollection *saved = tTraits;
-    NigBackdrop result = NigBackdropExplainInner(view, why);
+    NigBackdrop result = NigBackdropInner(view);
     tTraits = saved;
     return result;
-}
-
-static NigBackdrop NigBackdropOf(UIView *view) {
-    return NigBackdropExplain(view, NULL);
 }
 
 // Use only stable, explicit surface information. Rendering the entire window
@@ -1301,7 +1283,7 @@ static void NigApplyWebView(UIView *view, BOOL active) {
              inContentWorld:NigWebWorld()
           completionHandler:^(id result __unused, NSError *error) {
         if (error) {
-            os_log(TweakLog(), "ApelinWeb error %{public}@ %{public}s",
+            os_log(TweakLog(), "NigWeb error %{public}@ %{public}s",
                    error.localizedDescription, getprogname());
         }
     }];
@@ -1640,7 +1622,7 @@ static void HookedLayerSetContents(CALayer *self, SEL _cmd, id contents) {
                 CALayer *layer = weakLayer;
                 if (!view || !layer || rects.count == 0 || layer.contents != sourceObject) return;
                 NigProtectBarcodeView(view);
-                os_log(TweakLog(), "ApelinBarcode layer detected count=%lu %{public}s",
+                os_log(TweakLog(), "NigBarcode layer detected count=%lu %{public}s",
                        (unsigned long)rects.count, getprogname());
             });
         }
@@ -1801,7 +1783,7 @@ static void NigRefresh(void) {
     int sig = (system ? 1 : 0) | (traitDark ? 2 : 0) | (gNigEnabled ? 4 : 0) | (gWebEnabled ? 8 : 0);
     if (sig != lastSig) {
         lastSig = sig;
-        os_log(TweakLog(), "ApelinState active=%d system=%d published=%d traitDark=%d enabled=%d web=%d %{public}s",
+        os_log(TweakLog(), "NigState active=%d system=%d published=%d traitDark=%d enabled=%d web=%d %{public}s",
                active, system, NigPublishedStyle(), traitDark, gNigEnabled, gWebEnabled, getprogname());
     }
     gDarkModeActive = active;
@@ -1822,263 +1804,6 @@ static void NigRequestRefresh(void) {
         gRefreshPending = NO;
         NigRefresh();
     });
-}
-
-#pragma mark - Diagnostics dump
-
-// `com.imodcommission.nig.dump` makes the app in front write its whole
-// view and layer tree, with the colours Nig saw, changed and decided, to
-// <app tmp>/nig-dump-<time>.txt. It runs only on that signal or when the
-// user takes a screenshot: nothing is polled.
-static const char *const kDumpNotification = "com.imodcommission.nig.dump";
-
-static NSString *NigHex(UIColor *c) {
-    if (!c) return @"-";
-    UIColor *resolved = [c resolvedColorWithTraitCollection:(tTraits ?: (gResolveTraits ?: NigLightTraits()))] ?: c;
-    CGFloat r = 0, g = 0, b = 0, a = 0;
-    if (![resolved getRed:&r green:&g blue:&b alpha:&a]) return @"pattern";
-    int R = (int)lround(MAX(0.0, MIN(1.0, r)) * 255), G = (int)lround(MAX(0.0, MIN(1.0, g)) * 255),
-        B = (int)lround(MAX(0.0, MIN(1.0, b)) * 255);
-    NSMutableString *s = [NSMutableString stringWithFormat:@"#%02X%02X%02X", R, G, B];
-    if (a < 0.995) [s appendFormat:@"/%.2f", a];
-    if (resolved != c) [s appendString:@"(dyn)"];
-    return s;
-}
-
-static NSString *NigHexCG(CGColorRef c) {
-    return c ? NigHex([UIColor colorWithCGColor:c]) : @"-";
-}
-
-static NSString *NigContentsDesc(id contents) {
-    if (!contents) return nil;
-    CFTypeID t = CFGetTypeID((__bridge CFTypeRef)contents);
-    if (t == CGImageGetTypeID()) {
-        CGImageRef i = (__bridge CGImageRef)contents;
-        return [NSString stringWithFormat:@"CGImage %zux%zu", CGImageGetWidth(i), CGImageGetHeight(i)];
-    }
-    // Layer contents can be a plain Objective-C object (IOSurface, a backing
-    // store), whose type ID CoreFoundation never registered: describing it
-    // with CFCopyTypeIDDescription crashes (dpoint, on screenshot). The class
-    // name is always safe to read.
-    Class cls = object_getClass(contents);
-    return cls ? [NSString stringWithUTF8String:class_getName(cls)] : @"?";
-}
-
-static NSString *NigShort(NSString *text) {
-    if (!text) return @"";
-    NSString *s = text.length > 28 ? [[text substringToIndex:28] stringByAppendingString:@"…"] : text;
-    s = [s stringByReplacingOccurrencesOfString:@"\n" withString:@"⏎"];
-    return [s stringByReplacingOccurrencesOfString:@"\"" withString:@"'"];
-}
-
-static NSString *NigAttrColors(NSAttributedString *a, NSString *key) {
-    if (a.length == 0) return @"";
-    NSMutableOrderedSet<NSString *> *set = [NSMutableOrderedSet orderedSet];
-    [a enumerateAttribute:key inRange:NSMakeRange(0, a.length) options:0
-               usingBlock:^(id value, NSRange range __unused, BOOL *stop) {
-        [set addObject:[value isKindOfClass:[UIColor class]] ? NigHex(value) : (value ? @"?" : @"-")];
-        if (set.count >= 5) *stop = YES;
-    }];
-    return [set.array componentsJoinedByString:@","];
-}
-
-static NSString *NigBackdropName(NigBackdrop b) {
-    return b == NigBackdropDark ? @"Dark" : (b == NigBackdropLight ? @"Light" : @"Media");
-}
-
-static BOOL NigOverrides(Class cls, SEL sel) {
-    Method base = class_getInstanceMethod([UIView class], sel);
-    Method mine = class_getInstanceMethod(cls, sel);
-    return base && mine && method_getImplementation(base) != method_getImplementation(mine);
-}
-
-static NSString *NigStoredDesc(id obj, NSString *key) {
-    id v = NigStoreGet(obj, key);
-    if (!v) return nil;
-    if ([v isKindOfClass:[UIColor class]]) return NigHex(v);
-    if ([v isKindOfClass:[NSDictionary class]] && [v[@"orig"] isKindOfClass:[UIColor class]]) return NigHex(v[@"orig"]);
-    return @"yes";
-}
-
-static void NigDumpLayer(NSMutableString *out, CALayer *l, NSString *indent, int depth, NSUInteger *lines) {
-    if (*lines > 12000) return;
-    (*lines)++;
-    [out appendFormat:@"%@~%@ %p f=%@ bg=%@", indent, NSStringFromClass([l class]), l,
-                      NSStringFromCGRect(l.frame), NigHexCG(l.backgroundColor)];
-    NSString *was = NigStoredDesc(l, kLayerBg);
-    if (was) [out appendFormat:@" was=%@", was];
-    if ([l isKindOfClass:[CAShapeLayer class]]) {
-        CAShapeLayer *sh = (CAShapeLayer *)l;
-        [out appendFormat:@" fill=%@ stroke=%@", NigHexCG(sh.fillColor), NigHexCG(sh.strokeColor)];
-        NSString *fw = NigStoredDesc(l, kShapeFill);
-        if (fw) [out appendFormat:@" fillWas=%@", fw];
-    } else if ([l isKindOfClass:[CATextLayer class]]) {
-        CATextLayer *t = (CATextLayer *)l;
-        id str = t.string;
-        NSString *text = [str isKindOfClass:[NSAttributedString class]] ? [str string] : ([str isKindOfClass:[NSString class]] ? str : @"");
-        [out appendFormat:@" fg=%@ text=\"%@\"", NigHexCG(t.foregroundColor), NigShort(text)];
-    } else if ([l isKindOfClass:[CAGradientLayer class]]) {
-        NSMutableArray *cs = [NSMutableArray array];
-        for (id c in ((CAGradientLayer *)l).colors) {
-            if (CFGetTypeID((__bridge CFTypeRef)c) == CGColorGetTypeID()) [cs addObject:NigHexCG((__bridge CGColorRef)c)];
-        }
-        [out appendFormat:@" grad=[%@]", [cs componentsJoinedByString:@","]];
-    }
-    NSString *contents = NigContentsDesc(l.contents);
-    if (contents) [out appendFormat:@" contents=%@", contents];
-    if (l.filters.count) [out appendFormat:@" filters=%lu", (unsigned long)l.filters.count];
-    if (l.compositingFilter) [out appendFormat:@" comp=%@", l.compositingFilter];
-    if (l.mask) [out appendString:@" mask"];
-    if (l.hidden) [out appendString:@" HIDDEN"];
-    if (l.opacity < 0.999) [out appendFormat:@" op=%.2f", l.opacity];
-    if (l.borderWidth > 0) [out appendFormat:@" border=%@", NigHexCG(l.borderColor)];
-    [out appendString:@"\n"];
-    if (depth >= 3) return;
-    NSUInteger n = 0;
-    NSString *inner = [indent stringByAppendingString:@"  "];
-    for (CALayer *s in l.sublayers) {
-        if ([s.delegate isKindOfClass:[UIView class]]) continue;
-        if (++n > 16) { [out appendFormat:@"%@~… %lu more\n", inner, (unsigned long)(l.sublayers.count - 16)]; break; }
-        NigDumpLayer(out, s, inner, depth + 1, lines);
-    }
-}
-
-static void NigDumpView(NSMutableString *out, UIView *v, int depth, NSUInteger *lines) {
-    if (*lines > 12000) return;
-    (*lines)++;
-    NSString *indent = [@"" stringByPaddingToLength:(NSUInteger)MIN(depth, 80) withString:@" " startingAtIndex:0];
-    Class cls = [v class];
-    CALayer *layer = v.layer;
-    CGRect wf = [v convertRect:v.bounds toView:nil];
-    [out appendFormat:@"%@%@ %p w=%@", indent, NSStringFromClass(cls), v, NSStringFromCGRect(wf)];
-    if (v.hidden) [out appendString:@" HIDDEN"];
-    if (v.alpha < 0.999) [out appendFormat:@" a=%.2f", v.alpha];
-    [out appendFormat:@" bg=%@", NigHex(v.backgroundColor)];
-    NSString *bgWas = NigStoredDesc(v, kBg);
-    if (bgWas) [out appendFormat:@" was=%@", bgWas];
-    if ([layer class] != [CALayer class]) [out appendFormat:@" L=%@", NSStringFromClass([layer class])];
-    if (!v.backgroundColor && layer.backgroundColor) {
-        [out appendFormat:@" lbg=%@", NigHexCG(layer.backgroundColor)];
-        NSString *lw = NigStoredDesc(layer, kLayerBg);
-        if (lw) [out appendFormat:@" lwas=%@", lw];
-    }
-    NSString *contents = NigContentsDesc(layer.contents);
-    if (contents) [out appendFormat:@" contents=%@", contents];
-    if (layer.filters.count) [out appendFormat:@" filters=%lu%@", (unsigned long)layer.filters.count,
-                                                NigStoreGet(v, kInverted) ? @"(nig)" : @""];
-    if (layer.mask) [out appendString:@" mask"];
-    NSDictionary *recolor = NigStoreGet(v, kRecolor);
-    if (recolor) [out appendString:recolor[@"out"] ? @" recolor(nig)" : @" recolor-skipped"];
-    if (layer.borderWidth > 0) [out appendFormat:@" border=%@", NigHexCG(layer.borderColor)];
-    if (v.overrideUserInterfaceStyle != UIUserInterfaceStyleUnspecified)
-        [out appendFormat:@" override=%ld", (long)v.overrideUserInterfaceStyle];
-    NSNumber *web = NigStoreGet(v, kWeb);
-    if (web) [out appendFormat:@" web=%@", web.boolValue ? @"on" : @"off"];
-    if (v.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) [out appendString:@" traitDark"];
-    if (NigOverrides(cls, @selector(drawRect:))) [out appendString:@" drawRect"];
-    if (NigOverrides(cls, @selector(drawLayer:inContext:))) [out appendString:@" drawLayer"];
-    if (NigClassIsSystemUI(cls)) [out appendString:@" SYSTEM"];
-    NSString *why = nil;
-    NigBackdrop bd = NigBackdropExplain(v, &why);
-    [out appendFormat:@" bd=%@<%@>\n", NigBackdropName(bd), why ?: @""];
-    NIG_WITH_TRAITS(v);
-
-    NSString *detail = [indent stringByAppendingString:@"  | "];
-    if ([v isKindOfClass:[UILabel class]]) {
-        UILabel *l = (UILabel *)v;
-        NSAttributedString *a = l.attributedText;
-        [out appendFormat:@"%@label \"%@\" tc=%@", detail, NigShort(l.text), NigHex(l.textColor)];
-        NSString *tw = NigStoredDesc(l, kText);
-        if (tw) [out appendFormat:@" was=%@", tw];
-        if (l.highlighted || l.highlightedTextColor) {
-            [out appendFormat:@" hl%@=%@", l.highlighted ? @"(on)" : @"", NigHex(l.highlightedTextColor)];
-            NSString *hw = NigStoredDesc(l, kHiText);
-            if (hw) [out appendFormat:@" hlwas=%@", hw];
-        }
-        [out appendFormat:@" fg=[%@] runBg=[%@]%@\n", NigAttrColors(a, NSForegroundColorAttributeName),
-                          NigAttrColors(a, NSBackgroundColorAttributeName),
-                          NigStoreGet(l, kAttrOut) ? @" attr(nig)" : @""];
-    } else if ([v isKindOfClass:[UIButton class]]) {
-        UIButton *b = (UIButton *)v;
-        [out appendFormat:@"%@button \"%@\" title=%@", detail, NigShort([b titleForState:UIControlStateNormal]),
-                          NigHex([b titleColorForState:UIControlStateNormal])];
-        NSString *bw = NigStoredDesc(b, @"btn0");
-        if (bw) [out appendFormat:@" was=%@", bw];
-        if (@available(iOS 15.0, *)) {
-            UIButtonConfiguration *conf = b.configuration;
-            if (conf) [out appendFormat:@" config fg=%@ bg=%@", NigHex(conf.baseForegroundColor), NigHex(conf.baseBackgroundColor)];
-        }
-        [out appendString:@"\n"];
-    } else if ([v isKindOfClass:[UITextField class]]) {
-        UITextField *t = (UITextField *)v;
-        [out appendFormat:@"%@field tc=%@ ph=[%@]\n", detail, NigHex(t.textColor),
-                          NigAttrColors(t.attributedPlaceholder, NSForegroundColorAttributeName)];
-    } else if ([v isKindOfClass:[UITextView class]]) {
-        UITextView *t = (UITextView *)v;
-        [out appendFormat:@"%@textview \"%@\" tc=%@ fg=[%@]\n", detail, NigShort(t.text), NigHex(t.textColor),
-                          NigAttrColors(t.attributedText, NSForegroundColorAttributeName)];
-    } else if ([v isKindOfClass:[UIImageView class]]) {
-        UIImage *img = ((UIImageView *)v).image;
-        if (img) {
-            [out appendFormat:@"%@image %.0fx%.0f@%.0f mode=%ld sym=%d tint=%@%@\n", detail, img.size.width,
-                              img.size.height, img.scale, (long)img.renderingMode, img.isSymbolImage,
-                              NigHex(v.tintColor), NigStoreGet(v, kIcon) ? @" icon(nig)" : @""];
-        }
-    }
-    NIG_END_TRAITS();
-
-    NSUInteger n = 0;
-    NSString *inner = [indent stringByAppendingString:@"  "];
-    for (CALayer *s in layer.sublayers) {
-        if ([s.delegate isKindOfClass:[UIView class]]) continue;
-        if (++n > 16) { [out appendFormat:@"%@~… more layers\n", inner]; break; }
-        NigDumpLayer(out, s, inner, 1, lines);
-    }
-    if (v.hidden || v.alpha < 0.01) return;
-    for (UIView *sub in v.subviews) NigDumpView(out, sub, depth + 1, lines);
-}
-
-static void NigDumpControllers(NSMutableString *out, UIViewController *vc, int depth) {
-    if (!vc || depth > 12) return;
-    NSString *indent = [@"" stringByPaddingToLength:(NSUInteger)depth * 2 withString:@" " startingAtIndex:0];
-    [out appendFormat:@"%@VC %@ %p view=%p%@%@\n", indent, NSStringFromClass([vc class]), vc,
-                      vc.isViewLoaded ? vc.view : nil, vc.isViewLoaded && vc.view.window ? @" visible" : @"",
-                      vc.overrideUserInterfaceStyle != UIUserInterfaceStyleUnspecified
-                          ? [NSString stringWithFormat:@" override=%ld", (long)vc.overrideUserInterfaceStyle] : @""];
-    for (UIViewController *child in vc.childViewControllers) NigDumpControllers(out, child, depth + 1);
-    if (vc.presentedViewController && vc.presentedViewController.presentingViewController == vc) {
-        [out appendFormat:@"%@presents:\n", indent];
-        NigDumpControllers(out, vc.presentedViewController, depth + 1);
-    }
-}
-
-static void NigDump(NSString *reason) {
-    NSMutableString *out = [NSMutableString string];
-    NSMutableArray<UIWindow *> *windows = [NSMutableArray array];
-    NigProbeWindow(windows);
-    [out appendFormat:@"Nig dump (%@) %s build %s pid %d bundle %@\n", reason, getprogname(), APELIN_BUILD_ID, getpid(),
-                      [NSBundle mainBundle].bundleIdentifier];
-    [out appendFormat:@"active=%d everActive=%d resolve=%ld published=%d windows=%lu\n", gDarkModeActive,
-                      gEverActive, (long)gResolveStyle, NigPublishedStyle(), (unsigned long)windows.count];
-    [out appendString:@"legend: w=frame in window, bg/was=now/app's own, L=layer class, ~=plain sublayer,"
-                      " bd=backdrop Nig decided <who decided>\n"];
-    NSUInteger lines = 0;
-    for (UIWindow *w in windows) {
-        [out appendFormat:@"\n== %@ %p level=%.0f key=%d hidden=%d\n", NSStringFromClass([w class]), w,
-                          w.windowLevel, w.isKeyWindow, w.hidden];
-        if (w.hidden) continue;
-        NigDumpControllers(out, w.rootViewController, 0);
-        NigDumpView(out, w, 0, &lines);
-    }
-    if (lines > 12000) [out appendString:@"\n(truncated at 12000 lines)\n"];
-    NSDateFormatter *fmt = [NSDateFormatter new];
-    fmt.dateFormat = @"yyyyMMdd-HHmmss";
-    NSString *name = [NSString stringWithFormat:@"nig-dump-%@.txt", [fmt stringFromDate:[NSDate date]]];
-    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
-    NSError *error = nil;
-    BOOL ok = [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&error];
-    os_log(TweakLog(), "ApelinDump ok=%d lines=%lu bytes=%lu %{public}s %{public}@", ok, (unsigned long)lines,
-           (unsigned long)out.length, getprogname(), ok ? path : error.localizedDescription);
 }
 
 #pragma mark - Hooks: UIView
@@ -2272,7 +1997,7 @@ static void NigScanCompositeBarcodeView(UIView *view) {
         if (!current || !current.window || rects.count == 0 ||
             objc_getAssociatedObject(current, kNigBarcodeSnapshotToken) != token) return;
         NigProtectBarcodeView(current);
-        os_log(TweakLog(), "ApelinBarcode composite detected count=%lu %{public}s",
+        os_log(TweakLog(), "NigBarcode composite detected count=%lu %{public}s",
                (unsigned long)rects.count, getprogname());
     });
 }
@@ -2289,7 +2014,7 @@ static void HookedImageSetImage(UIImageView *self, SEL _cmd, UIImage *image) {
             UIImageView *view = weakView;
             if (!view || rects.count == 0 || view.image.CGImage != source) return;
             NigProtectBarcodeView(view);
-            os_log(TweakLog(), "ApelinBarcode native detected count=%lu %{public}s",
+            os_log(TweakLog(), "NigBarcode native detected count=%lu %{public}s",
                    (unsigned long)rects.count, getprogname());
         });
     }
@@ -2561,9 +2286,7 @@ static void NigInstallAppHooks(void) {
 }
 
 __attribute__((constructor)) static void TweakInitialize(void) {
-    // Apelin's confirm_loaded looks for this exact marker and build id under
-    // the package id's subsystem. Keep the line, and keep it public.
-    os_log(TweakLog(), "ApelinLoaded %{public}s in %{public}s", APELIN_BUILD_ID, getprogname());
+    os_log(TweakLog(), "NigLoaded in %{public}s", getprogname());
 
     if ([[NSBundle mainBundle].bundleIdentifier isEqualToString:@"com.apple.springboard"]) {
         // SpringBoard publishes only when UIKit reports a real trait change;
@@ -2602,19 +2325,6 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     notify_register_dispatch(kPrefsNotification, &prefsToken, dispatch_get_main_queue(), ^(int t __unused) {
         NigRequestRefresh();
     });
-    if (!gWebOnly) {  // a browser's tree holds the user's pages and titles: never dumped
-        int dumpToken = NOTIFY_TOKEN_INVALID;
-        notify_register_dispatch(kDumpNotification, &dumpToken, dispatch_get_main_queue(), ^(int t __unused) {
-            if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) NigDump(@"notify");
-        });
-        // A screenshot of a page that looks wrong also records that page's tree.
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationUserDidTakeScreenshotNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification *note __unused) {
-            NigDump(@"screenshot");
-        }];
-    }
     NigObserve(UIApplicationDidFinishLaunchingNotification, 0.6);
     NigObserve(UIApplicationWillEnterForegroundNotification, 0.0);
     NigObserve(UIApplicationDidBecomeActiveNotification, 0.6);

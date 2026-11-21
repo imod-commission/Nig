@@ -4,6 +4,7 @@
 #import <Preferences/PSListController.h>
 #import <notify.h>
 #import "NigSites.h"
+#import "NigPaths.h"
 
 // The pane's own strings, from Root.strings in en, ja, zh-Hans and zh-Hant. The
 // English text is the key, so a language without a table shows English.
@@ -37,15 +38,15 @@ static NSString *NigL(NSString *key) {
 }
 
 - (void)loadSites {
-    CFPreferencesAppSynchronize(CFSTR(APELIN_PACKAGE_ID));
-    id raw = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("blockedSites"), CFSTR(APELIN_PACKAGE_ID)));
+    CFPreferencesAppSynchronize(CFSTR(NIG_PACKAGE_ID));
+    id raw = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("blockedSites"), CFSTR(NIG_PACKAGE_ID)));
     _sites = [NigNormalizedSites(raw) mutableCopy];
 }
 
 - (void)saveSites {
-    CFPreferencesSetAppValue(CFSTR("blockedSites"), (__bridge CFArrayRef)[_sites copy], CFSTR(APELIN_PACKAGE_ID));
-    CFPreferencesAppSynchronize(CFSTR(APELIN_PACKAGE_ID));
-    notify_post(APELIN_PACKAGE_ID "/changed");
+    CFPreferencesSetAppValue(CFSTR("blockedSites"), (__bridge CFArrayRef)[_sites copy], CFSTR(NIG_PACKAGE_ID));
+    CFPreferencesAppSynchronize(CFSTR(NIG_PACKAGE_ID));
+    notify_post(NIG_PACKAGE_ID "/changed");
 }
 
 - (id)nigSiteValue:(PSSpecifier *)specifier {
