@@ -22,12 +22,16 @@
 #import <os/log.h>
 #import <math.h>
 #import <notify.h>
+#import <sys/stat.h>
+#import <errno.h>
 #import <substrate.h>
 // WebKit is reached at run time only (no link): apps without a web view
 // never load it because of Nig.
 #import <WebKit/WebKit.h>
 #import <Vision/Vision.h>
 #import "NigWebScript.h"
+#import "ApelinBootstrap.h"
+#import "NigSites.h"
 
 #pragma mark - Logging
 
@@ -378,6 +382,10 @@ static const char *const kPrefsChanged = APELIN_PACKAGE_ID "/changed";
 static const char *const kPrefsNotification = "com.imodcommission.nig.prefs";
 static BOOL gNigEnabled = YES;  // read in NigRefresh
 static BOOL gWebEnabled = YES;  // web pages inside apps
+// Safari, its in-app browser and Home Screen web apps already follow the
+// system: only their web pages are Nig's (see NigIsWebOnlyProcess).
+static BOOL gWebOnly = NO;
+static BOOL gWebActive = NO;    // the pages are recoloured now
 
 static BOOL NigPrefBool(CFStringRef key, BOOL fallback) {
     CFPropertyListRef v = CFPreferencesCopyAppValue(key, CFSTR(APELIN_PACKAGE_ID));
@@ -393,6 +401,69 @@ static BOOL NigPrefBool(CFStringRef key, BOOL fallback) {
     return out;
 }
 
+// The excluded sites live in the Settings domain, which a sandboxed app cannot
+// read, so SpringBoard copies them, cleaned, into a file under the bootstrap's
+// own var that every app can read. Apps look at it when the prefs change.
+static NSString *NigBlocklistPath(void) {
+    return ApelinBootstrapPath(@"/var/mobile/Library/Nig/excluded-sites.plist");
+}
+
+// SpringBoard only.
+static void NigPublishBlocklist(void) {
+    NSString *path = NigBlocklistPath();
+    if (!path) return;
+    NSArray<NSString *> *list = NigNormalizedSites(
+        CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("blockedSites"), CFSTR(APELIN_PACKAGE_ID))));
+    NSArray *have = [NSArray arrayWithContentsOfFile:path];
+    if (have && [have isEqual:list]) return;
+    NSError *error = nil;
+    [[NSFileManager defaultManager] createDirectoryAtPath:[path stringByDeletingLastPathComponent]
+                              withIntermediateDirectories:YES
+                                               attributes:@{NSFilePosixPermissions: @0755}
+                                                    error:&error];
+    BOOL ok = [list writeToFile:path atomically:YES];
+    if (ok) chmod(path.fileSystemRepresentation, 0644);
+    os_log(TweakLog(), "ApelinBlocklist written=%d sites=%lu", ok, (unsigned long)list.count);
+}
+
+// Apps only: the list as the last refresh read it, and its generation, which
+// a web view compares with the one its page script was made from.
+static NSArray<NSString *> *gBlockedSites;
+static NSInteger gBlockGen = 0;
+
+static void NigReadBlocklist(void) {
+    static struct timespec lastTime;
+    static off_t lastSize = -1;
+    static BOOL reported;
+    NSString *path = NigBlocklistPath();
+    if (!path) return;
+    struct stat st;
+    if (stat(path.fileSystemRepresentation, &st) != 0) {
+        if (errno != ENOENT && !reported) {
+            reported = YES;
+            os_log(TweakLog(), "ApelinBlocklist unreadable errno=%d %{public}s", errno, getprogname());
+        }
+        lastSize = -1;
+        if (gBlockedSites.count) {
+            gBlockedSites = @[];
+            gBlockGen++;
+        }
+        return;
+    }
+    if (st.st_size == lastSize && st.st_mtimespec.tv_sec == lastTime.tv_sec &&
+        st.st_mtimespec.tv_nsec == lastTime.tv_nsec) {
+        return;
+    }
+    lastSize = st.st_size;
+    lastTime = st.st_mtimespec;
+    NSArray<NSString *> *list = NigNormalizedSites([NSArray arrayWithContentsOfFile:path]);
+    if (![list isEqual:gBlockedSites ?: @[]]) {
+        gBlockedSites = list;
+        gBlockGen++;
+        os_log(TweakLog(), "ApelinBlocklist sites=%lu %{public}s", (unsigned long)list.count, getprogname());
+    }
+}
+
 // SpringBoard only.
 static void NigPublishPrefs(void) {
     static int token = NOTIFY_TOKEN_INVALID;
@@ -402,6 +473,7 @@ static void NigPublishPrefs(void) {
         return;
     }
     CFPreferencesAppSynchronize(CFSTR(APELIN_PACKAGE_ID));
+    NigPublishBlocklist();
     uint64_t state = (NigPrefBool(CFSTR("enabled"), YES) ? 0 : 1) | (NigPrefBool(CFSTR("web"), YES) ? 0 : 2);
     notify_set_state(token, state);
     notify_post(kPrefsNotification);
@@ -418,6 +490,7 @@ static void NigReadPrefs(void) {
     if (token != NOTIFY_TOKEN_INVALID) notify_get_state(token, &state);
     gNigEnabled = !(state & 1);
     gWebEnabled = gNigEnabled && !(state & 2);
+    if (gWebEnabled) NigReadBlocklist();
 }
 
 #pragma mark - Per-view memory of the app's own colours
@@ -1177,23 +1250,27 @@ static WKContentWorld *NigWebWorld(void) {
 
 static NSString *NigWebSource(BOOL on) {
     if (!on) return @"globalThis.__nigWeb && globalThis.__nigWeb.set(false);\n1;";
-    return [kNigWebEngine stringByAppendingString:@"globalThis.__nigWeb.set(true);\n1;"];
+    // The engine, the excluded sites, then on. Made again only when the list changed.
+    static NSString *cached;
+    static NSInteger cachedGen = -1;
+    if (!cached || cachedGen != gBlockGen) {
+        NSData *json = [NSJSONSerialization dataWithJSONObject:(gBlockedSites ?: @[]) options:0 error:nil];
+        NSString *list = json ? [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] : nil;
+        cached = [NSString stringWithFormat:@"%@globalThis.__nigWeb.block(%@);\nglobalThis.__nigWeb.set(true);\n1;",
+                  kNigWebEngine, list ?: @"[]"];
+        cachedGen = gBlockGen;
+    }
+    return cached;
 }
 
 // Adding the script is all it takes to turn it on. A user script cannot be
-// removed alone: turning it off puts back every other script the app added.
-static void NigSyncWebScript(WKUserContentController *ucc, BOOL on) {
+// removed alone: replacing or removing ours puts back every other script the
+// app added. `want` is 0 for off, else the list generation it was made from.
+static void NigSyncWebScript(WKUserContentController *ucc, NSInteger want) {
     if (!ucc || !NigWebWorld()) return;
-    NSNumber *has = objc_getAssociatedObject(ucc, kNigWebScriptKey);
-    if (has.boolValue == on) return;
-    if (on) {
-        WKUserScript *mine = [[NSClassFromString(@"WKUserScript") alloc]
-              initWithSource:NigWebSource(YES)
-               injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-            forMainFrameOnly:NO
-              inContentWorld:NigWebWorld()];
-        [ucc addUserScript:mine];
-    } else {
+    NSInteger have = [objc_getAssociatedObject(ucc, kNigWebScriptKey) integerValue];
+    if (have == want) return;
+    if (have != 0) {
         NSMutableArray<WKUserScript *> *keep = [NSMutableArray array];
         for (WKUserScript *s in ucc.userScripts) {
             if (![s.source hasPrefix:kNigWebMarker]) [keep addObject:s];
@@ -1201,15 +1278,23 @@ static void NigSyncWebScript(WKUserContentController *ucc, BOOL on) {
         [ucc removeAllUserScripts];
         for (WKUserScript *s in keep) [ucc addUserScript:s];
     }
-    objc_setAssociatedObject(ucc, kNigWebScriptKey, @(on), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (want != 0) {
+        WKUserScript *mine = [[NSClassFromString(@"WKUserScript") alloc]
+              initWithSource:NigWebSource(YES)
+               injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+            forMainFrameOnly:NO
+              inContentWorld:NigWebWorld()];
+        [ucc addUserScript:mine];
+    }
+    objc_setAssociatedObject(ucc, kNigWebScriptKey, @(want), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void NigApplyWebView(UIView *view, BOOL active) {
-    NSNumber *state = NigStoreGet(view, kWeb);
-    if (state ? state.boolValue == active : !active) return;
+    NSInteger want = active ? gBlockGen * 2 + 1 : 0;
+    if ([NigStoreGet(view, kWeb) integerValue] == want) return;
     WKWebView *web = (WKWebView *)view;
-    NigSyncWebScript(web.configuration.userContentController, active);
-    NigStoreSet(view, kWeb, @(active));
+    NigSyncWebScript(web.configuration.userContentController, want);
+    NigStoreSet(view, kWeb, @(want));
     if (!web.URL || !NigWebWorld()) return;  // its first page gets the user script
     [web evaluateJavaScript:NigWebSource(active)
                     inFrame:nil
@@ -1584,6 +1669,10 @@ static void HookedLayerSetContents(CALayer *self, SEL _cmd, id contents) {
 }
 
 static void NigApplySelf(UIView *view) {
+    if (gWebOnly) {
+        if (NigIsWebView(view)) NigApplyWebView(view, gWebActive);
+        return;
+    }
     if (!view || NigIsSystemUI(view)) return;
     BOOL active = gDarkModeActive && !NigHasBarcodeProtection(view);
     BOOL previous = tInHook;
@@ -1668,7 +1757,7 @@ static void NigScanCompositeBarcodeView(UIView *view);
 
 static void NigApplyTree(UIView *view, NSInteger depth) {
     if (!view || depth > 200) return;
-    NigScanCompositeBarcodeView(view);
+    if (!gWebOnly) NigScanCompositeBarcodeView(view);
     NigApplySelf(view);
     for (UIView *sub in [view.subviews copy]) {
         NigApplyTree(sub, depth + 1);
@@ -1716,6 +1805,7 @@ static void NigRefresh(void) {
                active, system, NigPublishedStyle(), traitDark, gNigEnabled, gWebEnabled, getprogname());
     }
     gDarkModeActive = active;
+    gWebActive = active && gWebEnabled;
     if (active) gEverActive = YES;
     if (!gEverActive) return;  // nothing was ever changed, nothing to restore
 
@@ -2096,6 +2186,11 @@ static void NigScheduleSettle(UIView *view) {
 // Restore detached/reused views even after the system has returned to light.
 static void HookedDidMoveToWindow(UIView *self, SEL _cmd) {
     OrigDidMoveToWindow(self, _cmd);
+    if (gWebOnly) {
+        // A page opened in a new tab or view is recoloured as it arrives.
+        if (self.window && [NSThread isMainThread] && NigIsWebView(self)) NigApplyWebView(self, gWebActive);
+        return;
+    }
     if (self.window && (gDarkModeActive || gEverActive) &&
         [NSThread isMainThread] && !tInHook) {
         // Compose Multiplatform draws a whole screen itself, as Flutter does:
@@ -2403,7 +2498,18 @@ static void HookedTraitCollectionDidChange(UIView *self, SEL _cmd, UITraitCollec
 
 #pragma mark - Entry point
 
+// Apple's browsers already follow the system, so only the pages they show are
+// Nig's: Safari, the browser an app opens in SFSafariViewController (and web
+// authentication sessions), and Home Screen web apps.
+static BOOL NigIsWebOnlyProcess(void) {
+    NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
+    return [bid isEqualToString:@"com.apple.mobilesafari"] ||
+           [bid isEqualToString:@"com.apple.SafariViewService"] ||
+           [bid hasPrefix:@"com.apple.webapp"];
+}
+
 static BOOL NigShouldRunInThisProcess(void) {
+    if (NigIsWebOnlyProcess()) return NSClassFromString(@"UIApplication") != Nil;
     NSBundle *main = [NSBundle mainBundle];
     NSString *bid = main.bundleIdentifier ?: @"";
     // Only real apps: no daemons, extensions or keyboards. Apple's own apps
@@ -2425,6 +2531,33 @@ static void NigObserve(NSNotificationName name, NSTimeInterval followUp) {
                            dispatch_get_main_queue(), ^{ NigRefresh(); });
         }
     }];
+}
+
+// What Nig changes in an app's own interface. Not in the browsers, where only
+// the pages are Nig's.
+static void NigInstallAppHooks(void) {
+    MSHookMessageEx([UIView class], @selector(setBackgroundColor:),
+                    (IMP)HookedSetBackgroundColor, (IMP *)&OrigSetBackgroundColor);
+    MSHookMessageEx([UIView class], @selector(setTintColor:),
+                    (IMP)HookedSetTintColor, (IMP *)&OrigSetTintColor);
+    MSHookMessageEx([UIImageView class], @selector(setImage:),
+                    (IMP)HookedImageSetImage, (IMP *)&OrigImageSetImage);
+    MSHookMessageEx([UILabel class], @selector(setTextColor:),
+                    (IMP)HookedLabelSetTextColor, (IMP *)&OrigLabelSetTextColor);
+    MSHookMessageEx([UILabel class], @selector(setHighlightedTextColor:),
+                    (IMP)HookedLabelSetHighlightedTextColor, (IMP *)&OrigLabelSetHighlightedTextColor);
+    MSHookMessageEx([UILabel class], @selector(setAttributedText:),
+                    (IMP)HookedLabelSetAttributedText, (IMP *)&OrigLabelSetAttributedText);
+    MSHookMessageEx([CALayer class], @selector(setBackgroundColor:),
+                    (IMP)HookedLayerSetBackgroundColor, (IMP *)&OrigLayerSetBackgroundColor);
+    MSHookMessageEx([CALayer class], @selector(setContents:),
+                    (IMP)HookedLayerSetContents, (IMP *)&OrigLayerSetContents);
+    MSHookMessageEx([UIView class], @selector(drawLayer:inContext:),
+                    (IMP)HookedDrawLayerInContext, (IMP *)&OrigDrawLayerInContext);
+    MSHookFunction((void *)CGContextSetFillColorWithColor,
+                   (void *)HookedSetFillColor, (void **)&OrigSetFillColor);
+    MSHookFunction((void *)CGContextSetStrokeColorWithColor,
+                   (void *)HookedSetStrokeColor, (void **)&OrigSetStrokeColor);
 }
 
 __attribute__((constructor)) static void TweakInitialize(void) {
@@ -2450,33 +2583,13 @@ __attribute__((constructor)) static void TweakInitialize(void) {
         return;
     }
     if (!NigShouldRunInThisProcess()) return;
+    gWebOnly = NigIsWebOnlyProcess();
     gBarcodeQueue = dispatch_queue_create("com.imodcommission.nig.barcode", DISPATCH_QUEUE_CONCURRENT);
     gFlutterApp = NSClassFromString(@"FlutterView") != Nil;
 
-    MSHookMessageEx([UIView class], @selector(setBackgroundColor:),
-                    (IMP)HookedSetBackgroundColor, (IMP *)&OrigSetBackgroundColor);
-    MSHookMessageEx([UIView class], @selector(setTintColor:),
-                    (IMP)HookedSetTintColor, (IMP *)&OrigSetTintColor);
     MSHookMessageEx([UIView class], @selector(didMoveToWindow),
                     (IMP)HookedDidMoveToWindow, (IMP *)&OrigDidMoveToWindow);
-    MSHookMessageEx([UIImageView class], @selector(setImage:),
-                    (IMP)HookedImageSetImage, (IMP *)&OrigImageSetImage);
-    MSHookMessageEx([UILabel class], @selector(setTextColor:),
-                    (IMP)HookedLabelSetTextColor, (IMP *)&OrigLabelSetTextColor);
-    MSHookMessageEx([UILabel class], @selector(setHighlightedTextColor:),
-                    (IMP)HookedLabelSetHighlightedTextColor, (IMP *)&OrigLabelSetHighlightedTextColor);
-    MSHookMessageEx([UILabel class], @selector(setAttributedText:),
-                    (IMP)HookedLabelSetAttributedText, (IMP *)&OrigLabelSetAttributedText);
-    MSHookMessageEx([CALayer class], @selector(setBackgroundColor:),
-                    (IMP)HookedLayerSetBackgroundColor, (IMP *)&OrigLayerSetBackgroundColor);
-    MSHookMessageEx([CALayer class], @selector(setContents:),
-                    (IMP)HookedLayerSetContents, (IMP *)&OrigLayerSetContents);
-    MSHookMessageEx([UIView class], @selector(drawLayer:inContext:),
-                    (IMP)HookedDrawLayerInContext, (IMP *)&OrigDrawLayerInContext);
-    MSHookFunction((void *)CGContextSetFillColorWithColor,
-                   (void *)HookedSetFillColor, (void **)&OrigSetFillColor);
-    MSHookFunction((void *)CGContextSetStrokeColorWithColor,
-                   (void *)HookedSetStrokeColor, (void **)&OrigSetStrokeColor);
+    if (!gWebOnly) NigInstallAppHooks();
 
     // UIApplication never had -application:didFinishLaunchingWithOptions: (it
     // is the delegate's), so the old hook on it never ran. Notifications are
@@ -2489,17 +2602,19 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     notify_register_dispatch(kPrefsNotification, &prefsToken, dispatch_get_main_queue(), ^(int t __unused) {
         NigRequestRefresh();
     });
-    int dumpToken = NOTIFY_TOKEN_INVALID;
-    notify_register_dispatch(kDumpNotification, &dumpToken, dispatch_get_main_queue(), ^(int t __unused) {
-        if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) NigDump(@"notify");
-    });
-    // A screenshot of a page that looks wrong also records that page's tree.
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationUserDidTakeScreenshotNotification
-                                                      object:nil
-                                                       queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(NSNotification *note __unused) {
-        NigDump(@"screenshot");
-    }];
+    if (!gWebOnly) {  // a browser's tree holds the user's pages and titles: never dumped
+        int dumpToken = NOTIFY_TOKEN_INVALID;
+        notify_register_dispatch(kDumpNotification, &dumpToken, dispatch_get_main_queue(), ^(int t __unused) {
+            if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) NigDump(@"notify");
+        });
+        // A screenshot of a page that looks wrong also records that page's tree.
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationUserDidTakeScreenshotNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *note __unused) {
+            NigDump(@"screenshot");
+        }];
+    }
     NigObserve(UIApplicationDidFinishLaunchingNotification, 0.6);
     NigObserve(UIApplicationWillEnterForegroundNotification, 0.0);
     NigObserve(UIApplicationDidBecomeActiveNotification, 0.6);

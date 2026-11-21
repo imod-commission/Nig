@@ -34,7 +34,7 @@
 			<key>label</key>
 			<string>Web pages</string>
 			<key>footerText</key>
-			<string>Recolours web pages shown inside apps (in-app browsers and web views). Turn it off if a page looks wrong.</string>
+			<string>Recolours web pages shown inside apps (in-app browsers and web views) and in Safari. Turn it off if a page looks wrong.</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -49,6 +49,20 @@
 			<string>com.imodcommission.nig</string>
 			<key>PostNotification</key>
 			<string>com.imodcommission.nig/changed</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>Pages on these sites are left as they are. A site covers its subdomains.</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSLinkCell</string>
+			<key>label</key>
+			<string>Excluded sites</string>
+			<key>detail</key>
+			<string>NigBlocklistController</string>
 		</dict>
 	</array>
 </dict>

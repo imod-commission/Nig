@@ -438,12 +438,48 @@
     if (e.target && e.target.tagName === 'LINK') repass();
   }, true);
 
+  /* Excluded sites (host or host/path, as NigNormalizeSite spells them):
+     the page is left as it is when its address, or for a frame the address
+     of the page that holds it, is one of them. */
+  var wanted = false, blocked = [], isBlocked = false;
+  function hostMatches(host, e) {
+    return host === e || (host.length > e.length && host.slice(host.length - e.length - 1) === '.' + e);
+  }
+  function siteMatches(e, host, path) {
+    var i = e.indexOf('/'), eh = i < 0 ? e : e.slice(0, i), ep = i < 0 ? '' : e.slice(i);
+    if (!hostMatches(host, eh)) return false;
+    return !ep || path === ep || path.indexOf(ep + '/') === 0;
+  }
+  function pageBlocked() {
+    if (!blocked.length) return false;
+    var loc = G.location, host = (loc.hostname || '').toLowerCase(), path = (loc.pathname || '').toLowerCase();
+    var tops = [];
+    try {
+      var ao = loc.ancestorOrigins;
+      if (ao && ao.length) tops.push(new URL(ao[ao.length - 1]).hostname.toLowerCase());
+    } catch (e) {}
+    for (var i = 0; i < blocked.length; i++) {
+      if (host && siteMatches(blocked[i], host, path)) return true;
+      for (var j = 0; j < tops.length; j++) if (tops[j] && siteMatches(blocked[i], tops[j], '')) return true;
+    }
+    return false;
+  }
+  function update() {
+    isBlocked = pageBlocked();
+    var on = wanted && !isBlocked;
+    if (on === active) { repass(); return; }
+    active = on;
+    if (on) start(); else stop();
+  }
+
   G.__nigWeb = {
     set: function (on) {
-      on = !!on;
-      if (on === active) { repass(); return; }
-      active = on;
-      if (on) start(); else stop();
+      wanted = !!on;
+      update();
+    },
+    block: function (list) {
+      blocked = Array.isArray(list) ? list.filter(function (x) { return typeof x === 'string' && x; }) : [];
+      update();
     },
     mapRGB: mapRGB,
     mapColor: mapColor,

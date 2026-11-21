@@ -51,7 +51,8 @@
         "Sources/*.m"
       ],
       "headerSearchPaths": [
-        "Sources"
+        "Sources",
+        "Shared"
       ],
       "objcARC": true,
       "frameworks": [
@@ -79,7 +80,8 @@
         "Prefs/Sources/*.m"
       ],
       "headerSearchPaths": [
-        "Prefs/Sources"
+        "Prefs/Sources",
+        "Shared"
       ],
       "resources": [
         "Prefs/Resources/Root.plist",
@@ -165,7 +167,7 @@
   "package": {
     "id": "com.imodcommission.nig",
     "name": "Nig",
-    "version": "1.5.0",
+    "version": "1.6.0",
     "description": "为未适配暗黑模式的应用自动启用暗黑模式效果。Dark mode for apps that do not support it.",
     "icon": "https://owngoal-dev.github.io/Apelin/icons/wiki.qaq.apelin.dev.tweak.png",
     "author": "imod_commission",
