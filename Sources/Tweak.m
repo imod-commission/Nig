@@ -367,6 +367,59 @@ static BOOL NigSystemIsDark(BOOL allowScreen) {
     return dark;
 }
 
+#pragma mark - Settings
+
+// The Settings pane stores `enabled` and `web` in the package's preferences
+// domain and posts kPrefsChanged. A sandboxed app cannot read another
+// domain, so SpringBoard reads them and publishes them as the state of
+// kPrefsNotification, as it does the style. 0 (also: not published yet) is
+// the default, everything on; bit 0 = Nig off, bit 1 = web pages off.
+static const char *const kPrefsChanged = APELIN_PACKAGE_ID "/changed";
+static const char *const kPrefsNotification = "com.imodcommission.nig.prefs";
+static BOOL gNigEnabled = YES;  // read in NigRefresh
+static BOOL gWebEnabled = YES;  // web pages inside apps
+
+static BOOL NigPrefBool(CFStringRef key, BOOL fallback) {
+    CFPropertyListRef v = CFPreferencesCopyAppValue(key, CFSTR(APELIN_PACKAGE_ID));
+    BOOL out = fallback;
+    if (v && CFGetTypeID(v) == CFBooleanGetTypeID()) {
+        out = CFBooleanGetValue((CFBooleanRef)v);
+    } else if (v && CFGetTypeID(v) == CFNumberGetTypeID()) {
+        int i = 0;
+        CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &i);
+        out = i != 0;
+    }
+    if (v) CFRelease(v);
+    return out;
+}
+
+// SpringBoard only.
+static void NigPublishPrefs(void) {
+    static int token = NOTIFY_TOKEN_INVALID;
+    if (token == NOTIFY_TOKEN_INVALID &&
+        notify_register_check(kPrefsNotification, &token) != NOTIFY_STATUS_OK) {
+        token = NOTIFY_TOKEN_INVALID;
+        return;
+    }
+    CFPreferencesAppSynchronize(CFSTR(APELIN_PACKAGE_ID));
+    uint64_t state = (NigPrefBool(CFSTR("enabled"), YES) ? 0 : 1) | (NigPrefBool(CFSTR("web"), YES) ? 0 : 2);
+    notify_set_state(token, state);
+    notify_post(kPrefsNotification);
+    os_log(TweakLog(), "ApelinPrefs state=%llu", state);
+}
+
+static void NigReadPrefs(void) {
+    static int token = NOTIFY_TOKEN_INVALID;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (notify_register_check(kPrefsNotification, &token) != NOTIFY_STATUS_OK) token = NOTIFY_TOKEN_INVALID;
+    });
+    uint64_t state = 0;
+    if (token != NOTIFY_TOKEN_INVALID) notify_get_state(token, &state);
+    gNigEnabled = !(state & 1);
+    gWebEnabled = gNigEnabled && !(state & 2);
+}
+
 #pragma mark - Per-view memory of the app's own colours
 
 static const void *kNigStoreKey = &kNigStoreKey;
@@ -1576,7 +1629,7 @@ static void NigApplySelf(UIView *view) {
         NigApplyImageView((UIImageView *)view, active);
     }
     NigApplyTextLayers(view, active);
-    if (NigIsWebView(view)) NigApplyWebView(view, active);
+    if (NigIsWebView(view)) NigApplyWebView(view, active && gWebEnabled);
     if (NigDrawsOwnBitmap(view)) NigApplyBitmapFilter(view, active);
     if (NigIsRecolorCandidate(view)) NigApplyRecolor(view, active);
 
@@ -1647,17 +1700,20 @@ static void NigRefresh(void) {
 
     if (!gFlutterApp) gFlutterApp = NSClassFromString(@"FlutterView") != Nil;
     BOOL system = NigSystemIsDark(YES);
+    NigReadPrefs();
     // Dynamic colours are read the way the app itself resolves them.
     BOOL traitDark = (probe.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
     NigSetResolveStyle(traitDark ? UIUserInterfaceStyleDark : UIUserInterfaceStyleLight);
-    BOOL active = system;
+    // Switched off in Settings: everything Nig changed is put back, as when
+    // the system turns light.
+    BOOL active = system && gNigEnabled;
 
     static int lastSig = -1;
-    int sig = (system ? 1 : 0) | (traitDark ? 2 : 0);
+    int sig = (system ? 1 : 0) | (traitDark ? 2 : 0) | (gNigEnabled ? 4 : 0) | (gWebEnabled ? 8 : 0);
     if (sig != lastSig) {
         lastSig = sig;
-        os_log(TweakLog(), "ApelinState active=%d system=%d published=%d traitDark=%d %{public}s",
-               active, system, NigPublishedStyle(), traitDark, getprogname());
+        os_log(TweakLog(), "ApelinState active=%d system=%d published=%d traitDark=%d enabled=%d web=%d %{public}s",
+               active, system, NigPublishedStyle(), traitDark, gNigEnabled, gWebEnabled, getprogname());
     }
     gDarkModeActive = active;
     if (active) gEverActive = YES;
@@ -2382,7 +2438,15 @@ __attribute__((constructor)) static void TweakInitialize(void) {
         MSHookMessageEx([UIView class], @selector(traitCollectionDidChange:),
                         (IMP)HookedTraitCollectionDidChange,
                         (IMP *)&OrigTraitCollectionDidChange);
-        dispatch_async(dispatch_get_main_queue(), ^{ NigPublishStyleIfChanged(); });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NigPublishStyleIfChanged();
+            NigPublishPrefs();
+        });
+        // The Settings pane posts this after each change.
+        int changedToken = NOTIFY_TOKEN_INVALID;
+        notify_register_dispatch(kPrefsChanged, &changedToken, dispatch_get_main_queue(), ^(int t __unused) {
+            NigPublishPrefs();
+        });
         return;
     }
     if (!NigShouldRunInThisProcess()) return;
@@ -2419,6 +2483,10 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     // the reliable trigger; the system style is read once the app is up.
     int styleToken = NOTIFY_TOKEN_INVALID;
     notify_register_dispatch(kStyleNotification, &styleToken, dispatch_get_main_queue(), ^(int t __unused) {
+        NigRequestRefresh();
+    });
+    int prefsToken = NOTIFY_TOKEN_INVALID;
+    notify_register_dispatch(kPrefsNotification, &prefsToken, dispatch_get_main_queue(), ^(int t __unused) {
         NigRequestRefresh();
     });
     int dumpToken = NOTIFY_TOKEN_INVALID;

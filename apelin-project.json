@@ -70,6 +70,36 @@
           "component": "substrate"
         }
       ]
+    },
+    {
+      "id": "prefs",
+      "type": "bundle",
+      "name": "NigPrefs",
+      "sources": [
+        "Prefs/Sources/*.m"
+      ],
+      "headerSearchPaths": [
+        "Prefs/Sources"
+      ],
+      "resources": [
+        "Prefs/Resources/Root.plist",
+        "Prefs/Resources/icon.png",
+        "Prefs/Resources/icon@2x.png",
+        "Prefs/Resources/icon@3x.png"
+      ],
+      "infoPlist": "Prefs/Resources/Info.plist",
+      "objcARC": true,
+      "frameworks": [
+        "Foundation",
+        "UIKit",
+        "Preferences"
+      ],
+      "extensionSupport": [
+        {
+          "extension": "wiki.qaq.apelin.dev.preferences",
+          "component": "preferences"
+        }
+      ]
     }
   ],
   "build": {
@@ -99,24 +129,64 @@
         "type": "sign",
         "product": "tweak",
         "identity": "adhoc"
+      },
+      {
+        "type": "compile",
+        "product": "prefs"
+      },
+      {
+        "type": "link",
+        "product": "prefs"
+      },
+      {
+        "type": "bundle-resources",
+        "product": "prefs"
+      },
+      {
+        "type": "lipo",
+        "product": "prefs"
+      },
+      {
+        "type": "dsym",
+        "product": "prefs"
+      },
+      {
+        "type": "strip",
+        "product": "prefs",
+        "style": "non-global"
+      },
+      {
+        "type": "sign",
+        "product": "prefs",
+        "identity": "adhoc"
       }
     ]
   },
   "package": {
     "id": "com.imodcommission.nig",
     "name": "Nig",
-    "version": "1.4.0",
+    "version": "1.5.0",
     "description": "为未适配暗黑模式的应用自动启用暗黑模式效果。Dark mode for apps that do not support it.",
     "icon": "https://owngoal-dev.github.io/Apelin/icons/wiki.qaq.apelin.dev.tweak.png",
     "author": "imod_commission",
     "section": "Tweaks",
     "depends": [
-      "mobilesubstrate"
+      "mobilesubstrate",
+      "preferenceloader"
     ],
     "layout": [
       {
         "path": "/Library/MobileSubstrate/DynamicLibraries/Nig.dylib",
         "product": "tweak"
+      },
+      {
+        "path": "/Library/PreferenceBundles/NigPrefs.bundle",
+        "product": "prefs"
+      },
+      {
+        "path": "/Library/PreferenceLoader/Preferences/NigPrefs.plist",
+        "file": "Prefs/Packaging/entry.plist",
+        "mode": "0644"
       }
     ],
     "tweakFilter": {
