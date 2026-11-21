@@ -167,7 +167,7 @@
   "package": {
     "id": "com.imodcommission.nig",
     "name": "Nig",
-    "version": "1.6.0",
+    "version": "1.6.1",
     "description": "为未适配暗黑模式的应用自动启用暗黑模式效果。Dark mode for apps that do not support it.",
     "icon": "https://owngoal-dev.github.io/Apelin/icons/wiki.qaq.apelin.dev.tweak.png",
     "author": "imod_commission",
@@ -184,6 +184,26 @@
       {
         "path": "/Library/PreferenceBundles/NigPrefs.bundle",
         "product": "prefs"
+      },
+      {
+        "path": "/Library/PreferenceBundles/NigPrefs.bundle/en.lproj/Root.strings",
+        "file": "Prefs/Localizations/en.lproj/Root.strings",
+        "mode": "0644"
+      },
+      {
+        "path": "/Library/PreferenceBundles/NigPrefs.bundle/ja.lproj/Root.strings",
+        "file": "Prefs/Localizations/ja.lproj/Root.strings",
+        "mode": "0644"
+      },
+      {
+        "path": "/Library/PreferenceBundles/NigPrefs.bundle/zh-Hans.lproj/Root.strings",
+        "file": "Prefs/Localizations/zh-Hans.lproj/Root.strings",
+        "mode": "0644"
+      },
+      {
+        "path": "/Library/PreferenceBundles/NigPrefs.bundle/zh-Hant.lproj/Root.strings",
+        "file": "Prefs/Localizations/zh-Hant.lproj/Root.strings",
+        "mode": "0644"
       },
       {
         "path": "/Library/PreferenceLoader/Preferences/NigPrefs.plist",

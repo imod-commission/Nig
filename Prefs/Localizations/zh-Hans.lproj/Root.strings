@@ -1,0 +1,18 @@
+/* Nig settings: Simplified Chinese */
+"Dark mode" = "深色模式";
+"Nig follows the system appearance: it only works while iOS is in Dark mode. Turn it off here to leave every app as it is. To exclude a single app, use Choicy." = "Nig 跟随系统外观：仅在 iOS 处于深色模式时生效。在此关闭后，所有 App 将保持原样。若只想排除某个 App，请使用 Choicy。";
+"Enabled" = "启用";
+"Web pages" = "网页";
+"Recolours web pages shown inside apps (in-app browsers and web views) and in Safari. Turn it off if a page looks wrong." = "为 App 内显示的网页（内置浏览器和网页视图）以及 Safari 中的网页重新配色。如果页面显示异常，请将其关闭。";
+"Recolour web pages" = "为网页重新配色";
+"Pages on these sites are left as they are. A site covers its subdomains." = "这些网站上的页面将保持原样。网站的子域名同样适用。";
+"Excluded sites" = "排除的网站";
+"Swipe a site to remove it. Pages on these sites are left as they are, in Safari and inside apps. A site covers its subdomains; add a path (example.com/shop) to leave only those pages." = "向左滑动网站即可将其移除。这些网站上的页面在 Safari 和 App 内都将保持原样。网站的子域名同样适用；添加路径（example.com/shop）则仅排除这些页面。";
+"No site is excluded. Tap + to add one: a domain such as example.com (its subdomains too) or a page address such as example.com/shop." = "尚未排除任何网站。点按 + 添加：可以是 example.com 这样的域名（包括其子域名），也可以是 example.com/shop 这样的页面地址。";
+"Exclude a site" = "排除网站";
+"Enter a domain or a page address." = "请输入域名或页面地址。";
+"Cancel" = "取消";
+"Add" = "添加";
+"Not an address" = "地址无效";
+"Enter a domain such as example.com." = "请输入 example.com 这样的域名。";
+"OK" = "好";

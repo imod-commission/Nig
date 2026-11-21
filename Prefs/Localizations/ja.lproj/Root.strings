@@ -1,0 +1,18 @@
+/* Nig settings: Japanese */
+"Dark mode" = "ダークモード";
+"Nig follows the system appearance: it only works while iOS is in Dark mode. Turn it off here to leave every app as it is. To exclude a single app, use Choicy." = "Nig はシステムの外観に従います。iOS がダークモードのときだけ動作します。ここでオフにすると、すべての App がそのままの表示になります。特定の App だけ除外するには Choicy を使ってください。";
+"Enabled" = "有効";
+"Web pages" = "Web ページ";
+"Recolours web pages shown inside apps (in-app browsers and web views) and in Safari. Turn it off if a page looks wrong." = "App 内に表示される Web ページ(アプリ内ブラウザや Web ビュー)と Safari の配色を変更します。ページの表示がおかしいときはオフにしてください。";
+"Recolour web pages" = "Web ページの配色を変更";
+"Pages on these sites are left as they are. A site covers its subdomains." = "これらのサイトのページはそのまま表示されます。サブドメインも対象です。";
+"Excluded sites" = "除外するサイト";
+"Swipe a site to remove it. Pages on these sites are left as they are, in Safari and inside apps. A site covers its subdomains; add a path (example.com/shop) to leave only those pages." = "サイトをスワイプすると削除できます。これらのサイトのページは、Safari でも App 内でもそのまま表示されます。サブドメインも対象です。パス(example.com/shop)を追加すると、そのページだけを除外できます。";
+"No site is excluded. Tap + to add one: a domain such as example.com (its subdomains too) or a page address such as example.com/shop." = "除外しているサイトはありません。+ をタップして追加します。example.com のようなドメイン(サブドメインを含む)か、example.com/shop のようなページのアドレスを入力してください。";
+"Exclude a site" = "サイトを除外";
+"Enter a domain or a page address." = "ドメインまたはページのアドレスを入力してください。";
+"Cancel" = "キャンセル";
+"Add" = "追加";
+"Not an address" = "アドレスが正しくありません";
+"Enter a domain such as example.com." = "example.com のようなドメインを入力してください。";
+"OK" = "OK";
