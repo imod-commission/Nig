@@ -1086,7 +1086,13 @@ static BOOL NigIsWebView(UIView *view) {
     return web && [view isKindOfClass:web];
 }
 
-static BOOL gFlutterApp = NO;  // see "Flutter apps" below
+// Flutter and Compose Multiplatform draw a whole screen themselves, into one
+// Metal layer, so there are no UIKit colours to change, and inverting that
+// layer would also swap barcodes and photos. What Nig can do honestly is tell
+// the engine the system is dark: it reads the brightness from the window's
+// traits (an app that locks itself to Light in its Info.plist gets the same
+// answer). An app with a dark theme then draws it; an app without one stays.
+static BOOL gFlutterApp = NO;
 
 static BOOL NigWantsDarkOverride(UIView *view) {
     if ([view isKindOfClass:[UIVisualEffectView class]]) {
@@ -1258,14 +1264,6 @@ static void NigApplyBitmapFilter(UIView *view, BOOL active) {
     NigSetInvertFilter(view, kInverted, NigShouldFilterBitmap(view, active));
 }
 
-#pragma mark - Flutter apps
-
-// Flutter draws a whole screen itself, into one Metal layer, so there are no
-// UIKit colours to change, and inverting that layer would also swap barcodes
-// and photos. What Nig can do honestly is tell Flutter the system is dark: the
-// engine reads the platform brightness from the window's traits (an app that
-// locks itself to Light in its Info.plist gets the same answer). An app with a
-// dark theme then draws it; an app without one stays as it is.
 #pragma mark - Text drawn off the main thread
 
 // Third-party text views (DinamicX's DXRichTextView, YYLabel, ...) render
@@ -2044,6 +2042,13 @@ static void HookedDidMoveToWindow(UIView *self, SEL _cmd) {
     OrigDidMoveToWindow(self, _cmd);
     if (self.window && (gDarkModeActive || gEverActive) &&
         [NSThread isMainThread] && !tInHook) {
+        // Compose Multiplatform draws a whole screen itself, as Flutter does:
+        // the first of its views to show tells Nig, and its window takes the
+        // dark trait the engine reads.
+        if (!gFlutterApp && strstr(class_getName([self class]), "androidx.compose.ui.")) {
+            gFlutterApp = YES;
+            NigApplySelf(self.window);
+        }
         NigApplySelf(self);
         if (gDarkModeActive) NigScheduleSettle(self);
     }
