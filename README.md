@@ -54,6 +54,8 @@ Download the package for your jailbreak from the [latest release](https://github
 | `Web/NigWeb.js` | The web page engine, embedded in `Sources/NigWebScript.h` by `Web/embed.py` |
 | `Shared/` | Code shared by the tweak and the settings pane |
 | `Prefs/` | The Settings pane, its strings and its icon |
+| `Prefs/Packaging/entry.plist` | The PreferenceLoader entry (becomes `NigPrefs.plist` in the package) |
+| `apelin-project.json` | The build description: products, package control fields, file layout and the injection filter. The `control` file and `Nig.plist` filter are generated from it at build time |
 | `assets/` | The package icon |
 
 ## License
